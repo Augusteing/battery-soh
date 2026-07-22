@@ -31,6 +31,7 @@ results/metrics/*
 # --- 本地环境 ---
 .env
 .git-home/
+.matplotlib/
 
 # --- 编辑器 / 系统 ---
 .idea/
