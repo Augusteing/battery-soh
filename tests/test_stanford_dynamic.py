@@ -32,8 +32,9 @@ def test_detect_capacity_column() -> None:
 def test_load_aging_summary_soh(fake_summaries) -> None:
     df = load_aging_summary(fake_summaries / "aging_summary_cell_003.csv")
     assert df["cell_id"].iloc[0] == "cell_003"
-    assert df["soh"].iloc[0] == pytest.approx(1.0)
-    assert df["soh"].iloc[-1] == pytest.approx(0.94)
+    # SOH 基准 = 前 10 个常规循环中位数 = (0.99+0.97)/2 = 0.98 * q0
+    assert df["soh"].iloc[0] == pytest.approx(1.0 / 0.98)
+    assert df["soh"].iloc[-1] == pytest.approx(0.94 / 0.98)
     assert df["cycle_index"].is_monotonic_increasing
 
 
