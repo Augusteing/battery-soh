@@ -1,0 +1,16 @@
+# 默认实验配置：一次实验复制一份并改名，禁止原地修改
+experiment:
+  name: baseline
+  seed: 42
+
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+
+model:
+  type: ecm_thevenin      # 等效电路模型：一阶 Thevenin
+  soc_estimator: eukf     # 备选：ekf / ukf / pf / data_driven
+  soh_estimator: online_rls
+
+evaluation:
+  metrics: [rmse, mae, max_abs_error]

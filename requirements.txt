@@ -1,0 +1,21 @@
+# 数值计算与数据处理
+numpy>=1.26
+scipy>=1.11
+pandas>=2.1
+
+# 可视化
+matplotlib>=3.8
+
+# 机器学习（深度学习框架按需单独安装，如 torch）
+scikit-learn>=1.4
+
+# 配置与工具
+pyyaml>=6.0
+tqdm>=4.66
+
+# 实验与测试
+jupyter>=1.0
+pytest>=8.0
+
+# 文档解析（scripts/extract_pdf.py）
+pypdf>=4.0

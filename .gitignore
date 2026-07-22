@@ -1,0 +1,39 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- 测试 / 缓存 ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- 数据与产物（保留目录结构，忽略内容） ---
+data/raw/*
+data/interim/*
+data/processed/*
+data/external/*
+!data/**/.gitkeep
+models/*
+!models/.gitkeep
+results/figures/*
+results/metrics/*
+!results/**/.gitkeep
+
+# --- 本地环境 ---
+.env
+.git-home/
+
+# --- 编辑器 / 系统 ---
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
