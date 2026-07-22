@@ -2,6 +2,8 @@
 numpy>=1.26
 scipy>=1.11
 pandas>=2.1
+pyarrow>=14
+h5py>=3.8
 
 # 可视化
 matplotlib>=3.8
@@ -12,6 +14,7 @@ scikit-learn>=1.4
 # 配置与工具
 pyyaml>=6.0
 tqdm>=4.66
+requests>=2.31
 
 # 实验与测试
 jupyter>=1.0
@@ -19,3 +22,6 @@ pytest>=8.0
 
 # 文档解析（scripts/extract_pdf.py）
 pypdf>=4.0
+
+# 深度学习（RTX 3060, 驱动 546.30 → CUDA 12.1）:
+# pip install torch --index-url https://download.pytorch.org/whl/cu121

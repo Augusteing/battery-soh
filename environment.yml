@@ -1,0 +1,23 @@
+# conda 环境（推荐）：conda env create -f environment.yml
+name: battery-soh
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - numpy>=1.26
+      - scipy>=1.11
+      - pandas>=2.1
+      - pyarrow>=14
+      - h5py>=3.8
+      - matplotlib>=3.8
+      - scikit-learn>=1.4
+      - pyyaml>=6.0
+      - tqdm>=4.66
+      - requests>=2.31
+      - pytest>=8.0
+      - jupyter>=1.0
+      - pypdf>=4.0
+      # GPU 深度学习（RTX 3060 + 驱动 546.30 → CUDA 12.1）:
+      # 创建环境后执行: pip install torch --index-url https://download.pytorch.org/whl/cu121
