@@ -1,13 +1,14 @@
 """MATR 批次 .mat -> 统一 SOH 标签表（从零实现）。
 
 用法:
-    python scripts/build_matr_soh_table.py
-    python scripts/build_matr_soh_table.py --mat <path> --out <path>
+    python scripts/build_matr_soh_table.py --mat <path1> [--mat <path2> ...]
+    python scripts/build_matr_soh_table.py  # 缺省扫描 data/external/matr/ 下全部批次
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -37,6 +38,12 @@ def _decode_policy(f: h5py.File, value) -> str:
     return raw.decode("latin1", errors="ignore").strip()
 
 
+def _batch_name(path: Path) -> str:
+    """规范化批次名：优先取文件名中的日期（YYYY-MM-DD），否则去掉 MATR_batch_ 前缀。"""
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", path.stem)
+    return m.group(1) if m else path.stem.replace("MATR_batch_", "")
+
+
 def extract_batch(path: Path) -> pd.DataFrame:
     """解析单个 MATR batch 文件，返回统一结构的 SOH 表。"""
     rows: list[pd.DataFrame] = []
@@ -45,7 +52,7 @@ def extract_batch(path: Path) -> pd.DataFrame:
         n_cells = batch["summary"].shape[0]
         cycle_life = [float(_deref(f, r).ravel()[0]) for r in batch["cycle_life"][()]]
         policies = [_decode_policy(f, r) for r in batch["policy_readable"][()]]
-        batch_name = path.stem.replace("MATR_batch_", "")
+        batch_name = _batch_name(path)
 
         for i in range(n_cells):
             summary = f[batch["summary"][i, 0]]
@@ -64,7 +71,6 @@ def extract_batch(path: Path) -> pd.DataFrame:
                     "cycle": "cycle_index",
                 }
             )
-            # 统一列名小写：IR -> ir, Tmax -> tmax ...
             df.columns = [c.lower() for c in df.columns]
             if "cycle_index" not in df:
                 df["cycle_index"] = np.arange(1, len(df) + 1)
@@ -90,23 +96,27 @@ def extract_batch(path: Path) -> pd.DataFrame:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "--mat", type=Path, default=ROOT / "data/external/matr/MATR_batch_20170512.mat"
-    )
+    parser.add_argument("--mat", type=Path, action="append", default=None, help="MATR 批次 .mat 路径，可重复；缺省扫描 data/external/matr/")
     parser.add_argument("--out", type=Path, default=ROOT / "data/processed/matr_soh_table.parquet")
     args = parser.parse_args()
 
-    table = extract_batch(args.mat)
+    mats = args.mat or sorted(
+        p for p in (ROOT / "data/external/matr").glob("*.mat")
+        if "MATR" in p.name or re.search(r"\d{4}-\d{2}-\d{2}", p.name)
+    )
+    if not mats:
+        parser.error("未找到任何 MATR .mat 文件，请用 --mat 指定路径")
+
+    table = pd.concat([extract_batch(p) for p in mats], ignore_index=True)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     if args.out.suffix == ".parquet":
         table.to_parquet(args.out, index=False)
     else:
         table.to_csv(args.out, index=False)
 
-    per_cell = table.groupby("cell_id").agg(
-        n_cycles=("cycle_index", "max"), soh_min=("soh", "min")
-    )
+    per_cell = table.groupby("cell_id").agg(n_cycles=("cycle_index", "max"), soh_min=("soh", "min"))
     print(f"cells: {len(per_cell)}  rows: {len(table)}")
+    print(f"batches: {sorted(table['batch'].unique())}")
     print(f"cycles per cell: {per_cell['n_cycles'].min()} - {per_cell['n_cycles'].max()}")
     print(f"min SOH reached: {per_cell['soh_min'].min():.3f}")
     print(f"saved -> {args.out}")

@@ -26,6 +26,7 @@ models/*
 !models/.gitkeep
 results/figures/*
 results/metrics/*
+results/runs/*
 !results/**/.gitkeep
 
 # --- 本地环境 ---
