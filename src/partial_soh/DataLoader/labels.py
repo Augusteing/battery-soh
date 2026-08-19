@@ -2,8 +2,11 @@
 
 本模块只负责从统一 SOH 表中生成两种标签：
 
-1. `soh_nominal = Q_discharge / 1.1`
-   这是 Scientific Reports 2026 论文使用的口径。
+1. `soh_nominal = Q_charge / 1.1`
+   这是 Scientific Reports 2026 论文使用的口径。论文原文：
+   "SOH is defined as the ratio between the current chargeable capacity
+   and the nominal capacity"，即“可充电容量 / 额定容量”。
+   对应统一 SOH 表中的 charge_capacity（QCharge）。
 
 2. `soh_q2 = Q_discharge / Q_discharge(cycle 2)`
    这是之前 World Model 复现使用的口径，保留用于和旧结果比较。
@@ -46,7 +49,7 @@ def build_labels(
       cell_id, cycle_index, discharge_capacity, charge_capacity, ir, batch, policy, cycle_life
 
     输出新增：
-      soh_nominal : 放电容量 / 额定容量；
+      soh_nominal : 可充电容量 / 额定容量（论文口径）；
       soh_q2      : 放电容量 / 每只电池 reference_cycle 的放电容量。
     """
     required = {
@@ -69,8 +72,8 @@ def build_labels(
 
     table = table.sort_values(["cell_id", "cycle_index"]).reset_index(drop=True)
 
-    # 论文口径：Qd / 1.1 Ah。
-    table["soh_nominal"] = table["discharge_capacity"] / nominal_capacity
+    # 论文口径：Q_charge / 1.1 Ah（current chargeable capacity / nominal capacity）。
+    table["soh_nominal"] = table["charge_capacity"] / nominal_capacity
 
     # 旧复现口径：Qd / Q(2)。
     refs: dict[str, float] = {}

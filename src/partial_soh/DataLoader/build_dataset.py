@@ -98,7 +98,7 @@ def build_index_table(
 
 
 def main() -> None:
-    """开发阶段使用小规模参数运行，避免一次性处理全部数据。"""
+    """开发阶段默认小规模运行；加 --full 生成全量片段索引表。"""
     sys.stdout.reconfigure(encoding="utf-8")
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -108,18 +108,26 @@ def main() -> None:
     parser.add_argument("--max-cells", type=int, default=3)
     parser.add_argument("--max-cycles", type=int, default=3)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="忽略 max-cells / max-cycles，处理全部 123 只电池的所有循环",
+    )
     args = parser.parse_args()
 
     labels = pd.read_parquet(args.labels)
     labels = mark_bad_cycles(labels)
     labels = labels[labels["is_valid_label"] & ~labels["is_bad_cycle"]].copy()
     splits = pd.read_parquet(args.splits)
+
+    max_cells = None if args.full else args.max_cells
+    max_cycles = None if args.full else args.max_cycles
     table = build_index_table(
         labels,
         splits,
         mat_dir=args.mat_dir,
-        max_cells=args.max_cells,
-        max_cycles_per_cell=args.max_cycles,
+        max_cells=max_cells,
+        max_cycles_per_cell=max_cycles,
     )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
