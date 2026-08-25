@@ -101,33 +101,47 @@ def load_raw_cycle(
     cycle_index = int(cycle_index)
 
     with h5py.File(str(mat_path), "r") as f:
-        batch = f["batch"]
-        n_cells = int(batch["cycles"].shape[0])
-        if not (0 <= cell_index < n_cells):
-            raise IndexError(f"cell_index={cell_index} 超出文件内电池数 {n_cells}")
+        return read_raw_cycle_from_file(f, cell_index, cycle_index)
 
-        # batch["cycles"] 是 HDF5 引用数组；先取引用，再解引用成 cell 结构。
-        cell_ref = batch["cycles"][cell_index, 0]
-        cell = f[cell_ref]
 
-        n_cycles = int(np.asarray(cell["V"]).shape[0])
-        if not (1 <= cycle_index <= n_cycles):
-            raise IndexError(f"cycle_index={cycle_index} 超出电池循环数 {n_cycles}")
+def read_raw_cycle_from_file(
+    f: h5py.File,
+    cell_index: int,
+    cycle_index: int,
+) -> dict[str, np.ndarray]:
+    """从“已经打开”的 h5py 文件句柄读取一个循环。
 
-        raw_index = cycle_index - 1
-        out: dict[str, np.ndarray] = {}
-        for name in RAW_FIELDS:
-            if name not in cell:
-                raise KeyError(f"cell 中缺少字段 {name}")
-            out[name] = _deref(f, cell[name][raw_index]).ravel()
+    与 load_raw_cycle 的逻辑完全相同，区别是不负责打开/关闭文件。
+    这样调用方可以一次性打开批次文件并复用句柄，避免反复开关文件的
+    I/O 开销（对全量预加载尤其重要）。
+    """
+    batch = f["batch"]
+    n_cells = int(batch["cycles"].shape[0])
+    if not (0 <= cell_index < n_cells):
+        raise IndexError(f"cell_index={cell_index} 超出文件内电池数 {n_cells}")
 
-        # 所有字段必须等长，否则说明原始数据有问题。
-        lengths = {name: len(arr) for name, arr in out.items()}
-        if len(set(lengths.values())) != 1:
-            raise ValueError(f"原始字段长度不一致: {lengths}")
+    # batch["cycles"] 是 HDF5 引用数组；先取引用，再解引用成 cell 结构。
+    cell_ref = batch["cycles"][cell_index, 0]
+    cell = f[cell_ref]
 
-        out["n_cycles"] = np.array(n_cycles, dtype=np.int64)
-        return out
+    n_cycles = int(np.asarray(cell["V"]).shape[0])
+    if not (1 <= cycle_index <= n_cycles):
+        raise IndexError(f"cycle_index={cycle_index} 超出电池循环数 {n_cycles}")
+
+    raw_index = cycle_index - 1
+    out: dict[str, np.ndarray] = {}
+    for name in RAW_FIELDS:
+        if name not in cell:
+            raise KeyError(f"cell 中缺少字段 {name}")
+        out[name] = _deref(f, cell[name][raw_index]).ravel()
+
+    # 所有字段必须等长，否则说明原始数据有问题。
+    lengths = {name: len(arr) for name, arr in out.items()}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"原始字段长度不一致: {lengths}")
+
+    out["n_cycles"] = np.array(n_cycles, dtype=np.int64)
+    return out
 
 
 if __name__ == "__main__":

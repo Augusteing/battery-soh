@@ -41,6 +41,10 @@ START_STEP_PCT = 0.01          # 起点每次移动 1% 额定容量
 STEPS_PER_PCT = 5              # 每 1% 额定容量插值成 5 步
 PREDICTION_CAPACITY_PCT = 0.07  # 电压预测窗口长度占额定容量的比例
 
+# 容量坐标的容差：充电曲线 Qc 的起点可能不是精确 0（例如 3.6e-6 Ah），
+# 也可能因为记录缺失而从某个正值开始。插值和合法性判断共用这个容差。
+CAPACITY_TOLERANCE_AH = 1e-4
+
 
 def capacity_grid(
     start_ah: float,
@@ -91,10 +95,10 @@ def interpolate_segment(
     q = np.asarray(charge["Qc"], dtype=float)
     if q.size < 2:
         raise ValueError("充电阶段点数不足，无法插值")
-    # 充电容量 Qc 的起点可能不是精确 0，而是 3e-6 Ah 这类极小值。
-    # 因此用很小的容差判断，并把插值端点夹回真实数据范围。
-    # 数据里 Qc 起点约为 3.6e-6 Ah，而不是精确 0；用 0.1 mAh 的容差。
-    tolerance = 1e-4
+    # 充电容量 Qc 的起点可能不是精确 0，而是 3e-6 Ah 这类极小值，
+    # 甚至因为记录缺失从一个正值开始。用很小的容差判断，并把插值端点
+    # 夹回真实数据范围。
+    tolerance = CAPACITY_TOLERANCE_AH
     if start_ah < q.min() - tolerance or end_ah > q.max() + tolerance:
         raise ValueError(
             f"片段 [{start_ah:.4f}, {end_ah:.4f}] Ah 超出充电容量范围 "
@@ -146,7 +150,9 @@ def build_segment_index_for_cycle(
     - is_valid_pretrain             : 该片段是否也拥有完整预测窗口。
     """
     charge = extract_charge_curve(raw)
+    q_min = float(np.asarray(charge["Qc"]).min())
     q_max = float(np.asarray(charge["Qc"]).max())
+    tolerance = CAPACITY_TOLERANCE_AH
 
     observed_len = observed_capacity_pct * nominal_capacity
     pred_len = prediction_capacity_pct * nominal_capacity
@@ -165,9 +171,12 @@ def build_segment_index_for_cycle(
                 "end_ah": end_ah,
                 "pred_start_ah": pred_start_ah,
                 "pred_end_ah": pred_end_ah,
-                "is_valid_soh": end_ah <= q_max,
-                "is_valid_pretrain": pred_end_ah <= q_max,
+                "is_valid_soh": (start_ah >= q_min - tolerance)
+                and (end_ah <= q_max + tolerance),
+                "is_valid_pretrain": (start_ah >= q_min - tolerance)
+                and (pred_end_ah <= q_max + tolerance),
                 "n_charge_points": int(len(charge["V"])),
+                "q_min_ah": q_min,
                 "q_max_ah": q_max,
             }
         )
