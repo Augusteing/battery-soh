@@ -81,7 +81,7 @@ def _memmap_safe_collate(batch):
     Python 开销约 50~80ms/step。memmap 数据集已经在 __getitems__
     里一次性堆叠成张量，所以可能收到两种输入：
 
-      1) (x, y) 已堆叠张量：batch[0] 形状 (B, 101, 3) —— 直接返回；
+      1) (x, y) 或 (x, y, x_future) 已堆叠张量：batch[0] 形状 (B, 101, 3)；
       2) [(x_i, y_i), ...] 样本列表（如 Subset 逐样本回退）：
          batch[0] 形状 (101, 3) —— 走 default_collate。
 
@@ -89,9 +89,9 @@ def _memmap_safe_collate(batch):
     """
     if (
         isinstance(batch, (tuple, list))
-        and len(batch) == 2
         and torch.is_tensor(batch[0])
         and batch[0].ndim == 3
+        and all(torch.is_tensor(b) for b in batch)
     ):
         return batch
     return torch.utils.data.default_collate(batch)
@@ -146,6 +146,7 @@ def pretrain_voltage(
     recon_lambda: float = 0.0,
     mask_ratio: float = 0.3,
     seed: int = 0,
+    accum_steps: int = 1,
 ) -> float:
     """在电压预测任务上预训练，返回最后一个 epoch 的平均损失。
 
@@ -154,6 +155,10 @@ def pretrain_voltage(
 
     创新 2（扩展自监督）：当 recon_lambda > 0 时，额外执行掩码电压
     重建任务——随机遮掉一部分电压点，用上下文把它们补回来。
+
+    论文对齐：预训练监督 = 观测窗内“下一步电压” + 未来 7% 容量窗的
+    自回归电压 rollout（voltage_rollout）。accum_steps 用于用较小的
+    batch 梯度累积模拟论文的 batch=20,000。
     """
     if optimizer is None:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -166,14 +171,23 @@ def pretrain_voltage(
     for epoch in range(start_epoch, epochs + 1):
         total, n = 0.0, 0
         total_recon = 0.0
-        for x, y in loader:
+        total_future = 0.0
+        optimizer.zero_grad()
+        for step, (x, y, x_future) in enumerate(loader, start=1):
             x = x.to(device)
             y = y.to(device)  # y 形状 (B, 100)，是 V[1:101]
+            x_future = x_future.to(device)  # (B, 36, 3)
 
             recon_loss_val = 0.0
+            future_loss_val = 0.0
             pred = model.voltage_predict(x)  # (B, 101)
-            # 只用前 100 步和下一步电压比较。
-            loss = loss_fn(pred[:, :-1], y)
+            # 损失 1：观测窗内“下一步电压”的密集监督。
+            # 除以 accum_steps：累积 N 步后再更新，等效于大 batch。
+            loss = loss_fn(pred[:, :-1], y) / accum_steps
+            # 损失 2：未来 7% 容量窗的自回归电压预测（论文对齐）。
+            rollout = model.voltage_rollout(x, x_future)  # (B, 36)
+            future_loss_val = loss_fn(rollout, x_future[:, :, 1])
+            loss = loss + future_loss_val / accum_steps
             if recon_lambda > 0:
                 # 1) 随机遮掉 mask_ratio 比例的电压点；
                 # 2) 用损坏后的输入走一次前向，重建被遮住的电压；
@@ -181,22 +195,31 @@ def pretrain_voltage(
                 x_c, mask = mask_voltage(x, mask_ratio, mask_gen)
                 recon = model.reconstruct(x_c)  # (B, T)
                 recon_loss_val = masked_reconstruction_loss(recon, x, mask)
-                loss = loss + recon_lambda * recon_loss_val
+                loss = loss + recon_lambda * recon_loss_val / accum_steps
 
-            optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            if step % accum_steps == 0:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+                optimizer.zero_grad()
 
-            total += float(loss.item()) * x.size(0)
+            total += float(loss.item()) * x.size(0) * accum_steps
             n += x.size(0)
             total_recon += float(recon_loss_val) * x.size(0)
+            total_future += float(future_loss_val) * x.size(0)
+
+        # epoch 末尾：如果剩余累积梯度不足 accum_steps，做最后一次更新。
+        if len(loader) % accum_steps != 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            optimizer.zero_grad()
 
         final_loss = total / n
         avg_recon = total_recon / n if recon_lambda > 0 else float("nan")
+        avg_future = total_future / n
         print(
             f"  [pretrain] epoch {epoch:3d}/{epochs}  "
-            f"loss={final_loss:.6f}  recon={avg_recon:.6f}"
+            f"loss={final_loss:.6f}  future={avg_future:.6f}  recon={avg_recon:.6f}"
         )
         if ckpt_path is not None:
             _save_checkpoint(ckpt_path, model, optimizer, "pretrain", epoch)
@@ -217,6 +240,7 @@ def finetune_soh(
     optimizer: torch.optim.Optimizer | None = None,
     consist_lambda: float = 0.0,
     group_size: int = 4,
+    accum_steps: int = 1,
 ) -> float:
     """在 SOH 回归任务上微调，返回最后一个 epoch 的平均损失。
 
@@ -235,13 +259,14 @@ def finetune_soh(
     for epoch in range(start_epoch, epochs + 1):
         total, n = 0.0, 0
         total_consist = 0.0
-        for x, y in loader:
+        optimizer.zero_grad()
+        for step, (x, y) in enumerate(loader, start=1):
             x = x.to(device)
             y = y.to(device)  # y 形状 (B,)
 
             consist_val = 0.0
             pred = model.soh_predict(x)  # (B,)
-            loss = loss_fn(pred, y)
+            loss = loss_fn(pred, y) / accum_steps
             if consist_lambda > 0:
                 # 批次由 SameCycleBatchSampler 构成：每 G 组、每组是
                 # 同一循环的 K 个片段。把预测 reshape 成 (G, K)，
@@ -249,16 +274,22 @@ def finetune_soh(
                 g = pred.numel() // group_size
                 pred_g = pred[: g * group_size].view(g, group_size)
                 consist_val = same_cycle_consistency_loss(pred_g)
-                loss = loss + consist_lambda * consist_val
+                loss = loss + consist_lambda * consist_val / accum_steps
 
-            optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            if step % accum_steps == 0:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+                optimizer.zero_grad()
 
-            total += float(loss.item()) * x.size(0)
+            total += float(loss.item()) * x.size(0) * accum_steps
             n += x.size(0)
             total_consist += float(consist_val) * x.size(0)
+
+        if len(loader) % accum_steps != 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            optimizer.zero_grad()
 
         final_loss = total / n
         avg_consist = total_consist / n if consist_lambda > 0 else float("nan")
@@ -366,6 +397,12 @@ def main() -> None:
         default=0.3,
         help="重建任务中遮掉电压点的比例（0~1）",
     )
+    parser.add_argument(
+        "--accum-steps",
+        type=int,
+        default=1,
+        help="梯度累积步数；batch 4096 × 5 可模拟论文的 batch 20,000",
+    )
     args = parser.parse_args()
 
     config = TrainingConfig(
@@ -380,6 +417,7 @@ def main() -> None:
 
     print(f"device: {device}")
     print(f"batch_size: {config.batch_size}")
+    print(f"梯度累积: {args.accum_steps} 步（等效 batch = {config.batch_size * args.accum_steps}）")
     print(f"创新开关: consistency={args.consistency}, recon_loss={args.recon_loss}")
     if args.consistency:
         effective_batch = args.batch_groups * args.group_size
@@ -500,6 +538,7 @@ def main() -> None:
                 recon_lambda=args.recon_lambda if args.recon_loss else 0.0,
                 mask_ratio=args.mask_ratio,
                 seed=config.seed + 2,
+                accum_steps=args.accum_steps,
             )
             print(f"预训练耗时: {time.perf_counter() - t0:.1f}s")
         # 预训练完成就保存一份纯权重，便于单独使用/对比。
@@ -531,6 +570,7 @@ def main() -> None:
             optimizer=opt,
             consist_lambda=args.consist_lambda if args.consistency else 0.0,
             group_size=args.group_size,
+            accum_steps=args.accum_steps,
         )
         print(f"微调耗时: {time.perf_counter() - t0:.1f}s")
 

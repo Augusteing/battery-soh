@@ -238,6 +238,20 @@ class PartialSohDataset(Dataset):
         x = np.stack([seg["I"], seg["V"], seg["capacity"]], axis=1).astype(np.float32)
         return x
 
+    def _interpolate_pred_window(
+        self,
+        charge: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+        pred_start_ah: float,
+        pred_end_ah: float,
+    ) -> np.ndarray:
+        """把未来 7% 预测窗口插值到等距容量网格，返回 (36, 3)。
+
+        论文预训练任务：观测窗（20% 容量）之后，还要预测接下来 7% 容量
+        窗内的电压演化。这里把该窗口的 [I, V, Q] 按同样规则插值出来，
+        供训练时的自回归 rollout 使用。
+        """
+        return self._interpolate_window(charge, pred_start_ah, pred_end_ah)
+
     def __len__(self) -> int:
         return len(self.cell_ids)
 
@@ -255,8 +269,9 @@ class PartialSohDataset(Dataset):
         x : (101, 3) 的 float32 张量；
         y : 取决于 task——
               soh      -> 标量 SOH，形状 ()；
-              pretrain -> 下一步电压 V[1:101]，形状 (100,)。
-                         这是“预测下一时刻电压”的密集监督目标。
+              pretrain -> (下一步电压 V[1:101] (100,), 未来窗 x_future (36, 3))。
+                          前一个是观测窗内的密集监督，后一个是 7% 预测窗
+                          的输入（I, V, Q），用于自回归 rollout。
         """
         cell_id = self.cell_ids[idx]
         cycle_index = int(self.cycle_indices[idx])
@@ -272,6 +287,15 @@ class PartialSohDataset(Dataset):
             # 预训练目标：把观测窗内的电压序列向后移一位，作为“下一步电压”。
             # x 的第 1 通道是电压，因此 y = V[1:101]。
             y = x[1:, 1]
+            # 未来窗：论文的 7% 容量预测窗口（36 个等距容量点）。
+            x_future = self._interpolate_pred_window(
+                charge, self.pred_start_ahs[idx], self.pred_end_ahs[idx]
+            )
+            return (
+                torch.from_numpy(x),
+                torch.from_numpy(y),
+                torch.from_numpy(x_future),
+            )
 
         return torch.from_numpy(x), torch.from_numpy(y)
 
@@ -325,6 +349,22 @@ class MemmapSohDataset(Dataset):
         self._y = np.load(cache_dir / f"y_{split}.npy")
         self._pretrain_mask = np.load(cache_dir / f"is_valid_pretrain_{split}.npy")
         self._group_ids = np.load(cache_dir / f"group_ids_{split}.npy")
+        self._x_future: np.ndarray | None = None
+        if task == "pretrain":
+            # 未来 7% 预测窗（36 点），只在预训练任务需要时载入，
+            # 避免 SOH 任务多占内存。
+            future_shape = tuple(int(v) for v in meta[f"shape_future_{split}"])
+            if in_memory:
+                self._x_future = np.fromfile(
+                    cache_dir / f"X_future_{split}.npy", dtype=np.float32
+                ).reshape(future_shape)
+            else:
+                self._x_future = np.memmap(
+                    str(cache_dir / f"X_future_{split}.npy"),
+                    dtype=np.float32,
+                    mode="r",
+                    shape=future_shape,
+                )
 
         if task == "pretrain":
             # 预训练任务只需要“拥有完整 7% 预测窗口”的片段。
@@ -354,6 +394,8 @@ class MemmapSohDataset(Dataset):
         else:
             # 与 PartialSohDataset 一致：下一步电压 V[1:101]。
             y = x[1:, 1]
+            x_future = torch.from_numpy(np.array(self._x_future[row]))  # (36, 3)
+            return x, y, x_future
         return x, y
 
     def __getitems__(self, indices: list[int]) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -379,9 +421,13 @@ class MemmapSohDataset(Dataset):
         x = torch.from_numpy(np.array(self._x[rows]))  # (B, 101, 3)
         if self.task == "soh":
             y = torch.from_numpy(np.array(self._y[rows]))  # (B,)
+            return x, y
         else:
             y = x[:, 1:, 1]  # (B, 100)
-        return x, y
+            x_future = torch.from_numpy(
+                np.array(self._x_future[rows])
+            )  # (B, 36, 3)
+            return x, y, x_future
 
 
 if __name__ == "__main__":

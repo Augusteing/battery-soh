@@ -192,6 +192,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=4096, help="普通模式 batch；分组模式有效 batch 由其对齐")
     parser.add_argument("--batch-groups", type=int, default=1024, help="分组模式每批循环数")
     parser.add_argument("--group-size", type=int, default=4, help="分组模式每个循环抽取的片段数")
+    parser.add_argument("--accum-steps", type=int, default=1, help="梯度累积步数（batch 4096 × 5 模拟论文 20,000）")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--preload", action="store_true", help="预加载充电曲线到内存（全量训练建议开启）")
     parser.add_argument("--max-samples", type=int, default=None, help="冒烟验证：每个配置只取前 N 个样本")
@@ -215,6 +216,7 @@ def main() -> None:
         "--batch-size", str(args.batch_size),
         "--batch-groups", str(args.batch_groups),
         "--group-size", str(args.group_size),
+        "--accum-steps", str(args.accum_steps),
         "--seed", str(args.seed),
         "--index", str(args.index),
         "--mat-dir", str(args.mat_dir),

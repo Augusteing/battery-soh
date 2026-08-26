@@ -15,6 +15,7 @@ CPU 成为瓶颈（GPU 大量时间在等数据）。实测一个 step 约 0.25s
 ----------------------
 cache_dir/
   X_<split>.npy                  float32 (N, 101, 3)  输入 [I, V, Q]
+  X_future_<split>.npy           float32 (N, 36, 3)   未来 7% 预测窗 [I, V, Q]
   y_<split>.npy                  float32 (N,)         SOH 标签
   is_valid_pretrain_<split>.npy  bool (N,)            预训练任务可用性
   group_ids_<split>.npy          int64 (N,)           同循环分组编号
@@ -93,6 +94,13 @@ def build_split(
     x = np.memmap(
         str(x_path), dtype=np.float32, mode="w+", shape=(n, 101, 3)
     )
+    # 未来 7% 预测窗：36 个等距容量点（7% * 1.1 Ah / 0.0022 Ah 每步）。
+    # 只有 is_valid_pretrain 的行才有效，其余行填 0（不会被预训练任务访问）。
+    x_future_path = cache_dir / f"X_future_{split}.npy"
+    x_future = np.memmap(
+        str(x_future_path), dtype=np.float32, mode="w+", shape=(n, 36, 3)
+    )
+    x_future[:] = 0.0
 
     files = discover_batch_files(mat_dir)
     handles = {batch: h5py.File(str(path), "r") for batch, path in files.items()}
@@ -123,6 +131,17 @@ def build_split(
             x[pos] = np.stack(
                 [seg["I"], seg["V"], seg["capacity"]], axis=1
             ).astype(np.float32)
+            if row.is_valid_pretrain:
+                seg_future = interpolate_segment(
+                    charge,
+                    start_ah=float(row.pred_start_ah),
+                    end_ah=float(row.pred_end_ah),
+                    nominal_capacity=nominal_capacity,
+                )
+                x_future[pos] = np.stack(
+                    [seg_future["I"], seg_future["V"], seg_future["capacity"]],
+                    axis=1,
+                ).astype(np.float32)
             pos += 1
 
         n_groups += 1
@@ -139,6 +158,7 @@ def build_split(
             pass
 
     x.flush()  # 确保 memmap 写回磁盘
+    x_future.flush()
     np.save(cache_dir / f"y_{split}.npy", y)
     np.save(cache_dir / f"is_valid_pretrain_{split}.npy", is_valid_pretrain)
     np.save(cache_dir / f"group_ids_{split}.npy", group_ids)
@@ -148,6 +168,7 @@ def build_split(
     if meta_path.exists():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     meta[f"shape_{split}"] = [int(n), 101, 3]
+    meta[f"shape_future_{split}"] = [int(n), 36, 3]
     meta[f"n_{split}"] = int(n)
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 

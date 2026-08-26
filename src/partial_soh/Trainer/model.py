@@ -7,13 +7,14 @@
     嵌入 W2        Linear(128, 32)
     LSTM           input=32, hidden=64, cell=64
     电压预测头      Linear(64, 128) -> ReLU -> Linear(128, 1)
-    SOH 估计头      Linear(64, 128) -> ReLU -> Linear(128, 1)
+    SOH 估计头      Linear(128, 128) -> ReLU -> Linear(128, 1)  # 输入 = [h; c] 拼接
     重建头（新增）  Linear(64, 128) -> ReLU -> Linear(128, 1)
 
 关键设计：编码器（嵌入 + LSTM）是共享的，两个任务只换输出头。
 
     - 预训练：电压头在每一步预测“下一步电压”，得到密集监督；
-    - 微调：  把电压头替换成 SOH 头，用最后一个隐藏状态回归标量 SOH。
+    - 微调：  把电压头替换成 SOH 头，用最后一个隐藏状态与细胞状态
+              的拼接 [h; c] 回归标量 SOH（对应论文“解耦隐藏态与细胞态”）。
     - 重建头：用于扩展自监督（掩码电压重建），在预训练阶段使用。
 """
 
@@ -53,14 +54,16 @@ class PartialSohLSTM(nn.Module):
             batch_first=True,
         )
 
-        # 两个输出头，结构相同：64 -> 128 -> 1。
+        # 电压头 / 重建头：64 -> 128 -> 1。
         self.voltage_head = nn.Sequential(
             nn.Linear(hidden, head_hidden),
             nn.ReLU(),
             nn.Linear(head_hidden, 1),
         )
+
+        # SOH 头：输入是 [h; c] 拼接（128 维），所以第一层是 128 -> 128。
         self.soh_head = nn.Sequential(
-            nn.Linear(hidden, head_hidden),
+            nn.Linear(hidden * 2, head_hidden),
             nn.ReLU(),
             nn.Linear(head_hidden, 1),
         )
@@ -96,10 +99,49 @@ class PartialSohLSTM(nn.Module):
         return self.voltage_head(lstm_out).squeeze(-1)
 
     def soh_predict(self, x: torch.Tensor) -> torch.Tensor:
-        """用最后一个隐藏状态回归标量 SOH，返回 (B,)。"""
-        _, h_n, _ = self.encode(x)
-        # h_n 形状 (1, B, 64)，取最后一行得到 (B, 64)。
-        return self.soh_head(h_n[-1]).squeeze(-1)
+        """用最后一个隐藏状态 h 与细胞状态 c 的拼接回归标量 SOH。
+
+        论文原文：“SOH estimation is evaluated by decoupling the internal
+        state information in hidden state and cell state of LSTM”。
+        这里用最简单的实现：把 h 和 c 拼成 128 维再进 SOH 头。
+        """
+        _, h_n, c_n = self.encode(x)
+        # h_n / c_n 形状 (1, B, 64)，取最后一行后拼接成 (B, 128)。
+        state = torch.cat([h_n[-1], c_n[-1]], dim=-1)
+        return self.soh_head(state).squeeze(-1)
+
+    def voltage_rollout(self, x_obs: torch.Tensor, x_future: torch.Tensor) -> torch.Tensor:
+        """从观测窗继续自回归预测未来窗的电压，返回 (B, T_future)。
+
+        论文的预训练任务：观测 20% 容量窗后，预测接下来 7% 容量窗内的
+        电压演化。实现方式：
+          1. 用观测窗的 (I, V, Q) 编码 LSTM，得到最终状态 (h, c)；
+          2. 在未来窗逐容量步展开：输入 = [I_future, V_pred_prev, Q_future]
+             （I、Q 来自未来窗的真实数据，V 用上一步的预测值，自回归）；
+          3. 每步的电压头输出作为该容量步的电压预测。
+
+        自回归（而不是把真实 V 喂进去）迫使模型真正“外推”电压演化，
+        而不是简单地复制上一步电压。
+        """
+        # 编码观测窗。
+        emb_obs = self.embed(x_obs)  # (B, 101, 32)
+        _, (h, c) = self.lstm(emb_obs)  # h/c: (1, B, 64)
+
+        # 自回归展开未来窗。
+        preds: list[torch.Tensor] = []
+        v_in = x_obs[:, -1, 1]  # (B,)，观测窗最后一个电压作为未来第一步的电压输入
+        for t in range(x_future.size(1)):
+            # 当前步输入：[I_future[t], V_in, Q_future[t]]，形状 (B, 3)。
+            u = torch.stack(
+                [x_future[:, t, 0], v_in, x_future[:, t, 2]], dim=1
+            )
+            emb = self.embed(u.unsqueeze(1))  # (B, 1, 32)
+            _, (h, c) = self.lstm(emb, (h, c))
+            v_hat = self.voltage_head(h[-1]).squeeze(-1)  # (B,)
+            preds.append(v_hat)
+            v_in = v_hat  # 自回归：用预测电压作为下一步输入
+
+        return torch.stack(preds, dim=1)  # (B, T_future)
 
     def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
         """重建每个时间步的电压，返回 (B, T)。
