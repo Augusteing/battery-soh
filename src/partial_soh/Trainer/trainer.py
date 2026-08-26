@@ -327,7 +327,8 @@ def evaluate_soh(
 
 
 def main() -> None:
-    sys.stdout.reconfigure(encoding="utf-8")
+    # line_buffering=True：每行立即输出，便于后台监控训练进度。
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--index", type=Path, default=ROOT / "data" / "processed" / "partial_segments_index.parquet")
