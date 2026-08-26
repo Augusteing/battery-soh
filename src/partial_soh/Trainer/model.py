@@ -8,11 +8,13 @@
     LSTM           input=32, hidden=64, cell=64
     电压预测头      Linear(64, 128) -> ReLU -> Linear(128, 1)
     SOH 估计头      Linear(64, 128) -> ReLU -> Linear(128, 1)
+    重建头（新增）  Linear(64, 128) -> ReLU -> Linear(128, 1)
 
 关键设计：编码器（嵌入 + LSTM）是共享的，两个任务只换输出头。
 
     - 预训练：电压头在每一步预测“下一步电压”，得到密集监督；
     - 微调：  把电压头替换成 SOH 头，用最后一个隐藏状态回归标量 SOH。
+    - 重建头：用于扩展自监督（掩码电压重建），在预训练阶段使用。
 """
 
 from __future__ import annotations
@@ -63,6 +65,16 @@ class PartialSohLSTM(nn.Module):
             nn.Linear(head_hidden, 1),
         )
 
+        # 重建头：把“当前时间步的隐藏状态”映射回“当前时间步的电压”。
+        # 与电压预测头的区别：
+        #   电压头 : 隐藏状态 h_t -> V_{t+1}（预测下一步，预训练主任务）；
+        #   重建头 : 隐藏状态 h_t -> V_t    （与输入对齐，用于掩码重建）。
+        self.recon_head = nn.Sequential(
+            nn.Linear(hidden, head_hidden),
+            nn.ReLU(),
+            nn.Linear(head_hidden, 1),
+        )
+
     def encode(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -89,6 +101,16 @@ class PartialSohLSTM(nn.Module):
         # h_n 形状 (1, B, 64)，取最后一行得到 (B, 64)。
         return self.soh_head(h_n[-1]).squeeze(-1)
 
+    def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
+        """重建每个时间步的电压，返回 (B, T)。
+
+        用于掩码电压重建：输入 x 的电压通道被部分遮住，重建头从
+        LSTM 每个时间步的隐藏状态里“补出”该时刻的电压。
+        """
+        lstm_out, _, _ = self.encode(x)
+        # lstm_out: (B, T, 64) -> 重建头 -> (B, T, 1) -> 去掉最后一维。
+        return self.recon_head(lstm_out).squeeze(-1)
+
 
 if __name__ == "__main__":
     """冒烟测试：随机输入，检查两个头的前向形状。"""
@@ -102,10 +124,12 @@ if __name__ == "__main__":
 
     v = model.voltage_predict(x)
     s = model.soh_predict(x)
+    r = model.reconstruct(x)
 
     print(f"输入 x.shape       : {tuple(x.shape)}")
     print(f"电压预测 v.shape   : {tuple(v.shape)}")
     print(f"SOH 预测 s.shape   : {tuple(s.shape)}")
+    print(f"电压重建 r.shape   : {tuple(r.shape)}")
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"总参数量           : {n_params:,}")

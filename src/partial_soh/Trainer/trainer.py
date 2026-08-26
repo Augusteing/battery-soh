@@ -30,8 +30,13 @@ TR_DIR = ROOT / "src" / "partial_soh" / "Trainer"
 if str(TR_DIR) not in sys.path:
     sys.path.insert(0, str(TR_DIR))
 
+from consistency import (  # noqa: E402
+    SameCycleBatchSampler,
+    same_cycle_consistency_loss,
+)
 from dataset import PartialSohDataset  # noqa: E402
 from model import PartialSohLSTM  # noqa: E402
+from ssl_tasks import mask_voltage, masked_reconstruction_loss  # noqa: E402
 
 
 @dataclass
@@ -54,6 +59,18 @@ def _set_seed(seed: int) -> None:
     """固定随机种子，保证可复现。"""
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+
+def _get_group_ids(ds) -> np.ndarray:
+    """从 Dataset（或 Subset）取出每个样本的循环编号。
+
+    Subset 是 PyTorch 对 Dataset 的切片包装（--max-samples 冒烟测试时
+    会用到），需要先还原到原 Dataset，再按子集下标切片，
+    才能拿到与子集对应的 group_ids。
+    """
+    if isinstance(ds, Subset):
+        return ds.dataset.group_ids()[ds.indices]
+    return ds.group_ids()
 
 
 def _ckpt_path(model_out: Path) -> Path:
@@ -102,20 +119,29 @@ def pretrain_voltage(
     ckpt_path: Path | None = None,
     start_epoch: int = 1,
     optimizer: torch.optim.Optimizer | None = None,
+    recon_lambda: float = 0.0,
+    mask_ratio: float = 0.3,
+    seed: int = 0,
 ) -> float:
     """在电压预测任务上预训练，返回最后一个 epoch 的平均损失。
 
     支持断点续训：start_epoch 指定从第几个 epoch 开始，
     optimizer 为之前保存的优化器状态；每个 epoch 结束会保存 checkpoint。
+
+    创新 2（扩展自监督）：当 recon_lambda > 0 时，额外执行掩码电压
+    重建任务——随机遮掉一部分电压点，用上下文把它们补回来。
     """
     if optimizer is None:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
     model.train()
+    # 掩码重建的随机数生成器：固定种子，保证可复现。
+    mask_gen = torch.Generator().manual_seed(seed)
 
     final_loss = float("nan")
     for epoch in range(start_epoch, epochs + 1):
         total, n = 0.0, 0
+        total_recon = 0.0
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)  # y 形状 (B, 100)，是 V[1:101]
@@ -123,6 +149,15 @@ def pretrain_voltage(
             pred = model.voltage_predict(x)  # (B, 101)
             # 只用前 100 步和下一步电压比较。
             loss = loss_fn(pred[:, :-1], y)
+            recon_loss_val = 0.0
+            if recon_lambda > 0:
+                # 1) 随机遮掉 mask_ratio 比例的电压点；
+                # 2) 用损坏后的输入走一次前向，重建被遮住的电压；
+                # 3) 只统计掩码位置的重建误差。
+                x_c, mask = mask_voltage(x, mask_ratio, mask_gen)
+                recon = model.reconstruct(x_c)  # (B, T)
+                recon_loss_val = masked_reconstruction_loss(recon, x, mask)
+                loss = loss + recon_lambda * recon_loss_val
 
             optimizer.zero_grad()
             loss.backward()
@@ -131,9 +166,14 @@ def pretrain_voltage(
 
             total += float(loss.item()) * x.size(0)
             n += x.size(0)
+            total_recon += float(recon_loss_val) * x.size(0)
 
         final_loss = total / n
-        print(f"  [pretrain] epoch {epoch:3d}/{epochs}  loss={final_loss:.6f}")
+        avg_recon = total_recon / n if recon_lambda > 0 else float("nan")
+        print(
+            f"  [pretrain] epoch {epoch:3d}/{epochs}  "
+            f"loss={final_loss:.6f}  recon={avg_recon:.6f}"
+        )
         if ckpt_path is not None:
             _save_checkpoint(ckpt_path, model, optimizer, "pretrain", epoch)
             print(f"  [checkpoint] saved -> {ckpt_path}")
@@ -151,10 +191,16 @@ def finetune_soh(
     ckpt_path: Path | None = None,
     start_epoch: int = 1,
     optimizer: torch.optim.Optimizer | None = None,
+    consist_lambda: float = 0.0,
+    group_size: int = 4,
 ) -> float:
     """在 SOH 回归任务上微调，返回最后一个 epoch 的平均损失。
 
     支持断点续训，逻辑与 pretrain_voltage 相同。
+
+    创新 1（同循环一致性）：当 consist_lambda > 0 时，批次由
+    SameCycleBatchSampler 提供（每组是同一循环的 K 个片段），
+    在数据损失之外额外惩罚组内预测的离散程度。
     """
     if optimizer is None:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -164,12 +210,22 @@ def finetune_soh(
     final_loss = float("nan")
     for epoch in range(start_epoch, epochs + 1):
         total, n = 0.0, 0
+        total_consist = 0.0
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)  # y 形状 (B,)
 
             pred = model.soh_predict(x)  # (B,)
             loss = loss_fn(pred, y)
+            consist_val = 0.0
+            if consist_lambda > 0:
+                # 批次由 SameCycleBatchSampler 构成：每 G 组、每组是
+                # 同一循环的 K 个片段。把预测 reshape 成 (G, K)，
+                # 惩罚每组内部的离散程度（组内方差）。
+                g = pred.numel() // group_size
+                pred_g = pred[: g * group_size].view(g, group_size)
+                consist_val = same_cycle_consistency_loss(pred_g)
+                loss = loss + consist_lambda * consist_val
 
             optimizer.zero_grad()
             loss.backward()
@@ -178,9 +234,14 @@ def finetune_soh(
 
             total += float(loss.item()) * x.size(0)
             n += x.size(0)
+            total_consist += float(consist_val) * x.size(0)
 
         final_loss = total / n
-        print(f"  [finetune] epoch {epoch:3d}/{epochs}  loss={final_loss:.6f}")
+        avg_consist = total_consist / n if consist_lambda > 0 else float("nan")
+        print(
+            f"  [finetune] epoch {epoch:3d}/{epochs}  "
+            f"loss={final_loss:.6f}  consist={avg_consist:.6f}"
+        )
         if ckpt_path is not None:
             _save_checkpoint(ckpt_path, model, optimizer, "finetune", epoch)
             print(f"  [checkpoint] saved -> {ckpt_path}")
@@ -234,6 +295,47 @@ def main() -> None:
         help="从 model-out 同目录的 .ckpt 断点续训",
     )
     parser.add_argument("--model-out", type=Path, default=ROOT / "models" / "partial_soh_lstm.pt")
+    # ---- 创新特性开关（本分支新增）----
+    parser.add_argument(
+        "--consistency",
+        action="store_true",
+        help="启用同循环一致性约束：同一循环的多个片段输出应一致",
+    )
+    parser.add_argument(
+        "--consist-lambda",
+        type=float,
+        default=1.0,
+        help="一致性损失权重；设为 0 等于“只改采样方式、不加约束”的对照",
+    )
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        default=4,
+        help="每个循环抽取 K 个片段组成一组（K>=2 才有意义）",
+    )
+    parser.add_argument(
+        "--batch-groups",
+        type=int,
+        default=512,
+        help="每个批次包含多少个循环；有效 batch = batch-groups × group-size",
+    )
+    parser.add_argument(
+        "--recon-loss",
+        action="store_true",
+        help="启用扩展自监督：掩码电压重建",
+    )
+    parser.add_argument(
+        "--recon-lambda",
+        type=float,
+        default=1.0,
+        help="掩码重建损失权重",
+    )
+    parser.add_argument(
+        "--mask-ratio",
+        type=float,
+        default=0.3,
+        help="重建任务中遮掉电压点的比例（0~1）",
+    )
     args = parser.parse_args()
 
     config = TrainingConfig(
@@ -248,6 +350,15 @@ def main() -> None:
 
     print(f"device: {device}")
     print(f"batch_size: {config.batch_size}")
+    print(f"创新开关: consistency={args.consistency}, recon_loss={args.recon_loss}")
+    if args.consistency:
+        effective_batch = args.batch_groups * args.group_size
+        print(
+            f"  一致性: batch_groups={args.batch_groups} × group_size={args.group_size} "
+            f"= 有效 batch {effective_batch}, λ={args.consist_lambda}"
+        )
+    if args.recon_loss:
+        print(f"  重建: mask_ratio={args.mask_ratio}, λ={args.recon_lambda}")
 
     # 两个任务各建一个 Dataset，都用 train 划分。直接训练模式不需要预训练数据集。
     soh_ds = PartialSohDataset(
@@ -265,6 +376,11 @@ def main() -> None:
             pretrain_ds = Subset(pretrain_ds, range(n))
         print(f"冒烟测试：只取前 {n} 个样本")
 
+    # 一致性模式需要“每个片段属于哪个循环”的映射来构造分组批次。
+    if args.consistency:
+        group_ids = _get_group_ids(soh_ds)
+        print(f"一致性采样器：{len(group_ids)} 个片段，按循环分组")
+
     if not args.no_pretrain:
         pretrain_loader = DataLoader(
             pretrain_ds,
@@ -272,12 +388,23 @@ def main() -> None:
             shuffle=True,
             num_workers=0,
         )
-    soh_loader = DataLoader(
-        soh_ds,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=0,
-    )
+    if args.consistency:
+        # 用“循环分组”的批次采样器替代普通 shuffle：
+        # 每个批次 = batch_groups 个循环 × group_size 个同循环片段。
+        batch_sampler = SameCycleBatchSampler(
+            group_ids,
+            group_size=args.group_size,
+            batch_groups=args.batch_groups,
+            seed=config.seed + 1,
+        )
+        soh_loader = DataLoader(soh_ds, batch_sampler=batch_sampler, num_workers=0)
+    else:
+        soh_loader = DataLoader(
+            soh_ds,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=0,
+        )
 
     model = PartialSohLSTM().to(device)
     ckpt_path = _ckpt_path(args.model_out)
@@ -315,6 +442,9 @@ def main() -> None:
                 ckpt_path=ckpt_path,
                 start_epoch=start,
                 optimizer=opt,
+                recon_lambda=args.recon_lambda if args.recon_loss else 0.0,
+                mask_ratio=args.mask_ratio,
+                seed=config.seed + 2,
             )
             print(f"预训练耗时: {time.perf_counter() - t0:.1f}s")
         # 预训练完成就保存一份纯权重，便于单独使用/对比。
@@ -344,6 +474,8 @@ def main() -> None:
             ckpt_path=ckpt_path,
             start_epoch=start,
             optimizer=opt,
+            consist_lambda=args.consist_lambda if args.consistency else 0.0,
+            group_size=args.group_size,
         )
         print(f"微调耗时: {time.perf_counter() - t0:.1f}s")
 

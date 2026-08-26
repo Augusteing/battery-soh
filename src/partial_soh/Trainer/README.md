@@ -11,8 +11,10 @@
 | 文件 | 职责 |
 | --- | --- |
 | `dataset.py` | 惰性加载的 PyTorch Dataset：索引 -> MAT -> 插值 -> `(101, 3)` 张量 |
-| `model.py` | 共享编码器（嵌入 + LSTM）+ 电压头 / SOH 头 |
+| `model.py` | 共享编码器（嵌入 + LSTM）+ 电压头 / SOH 头 / 重建头 |
 | `trainer.py` | 预训练 + 微调 + 评估的入口 |
+| `consistency.py` | 创新 1：同循环一致性约束（分组采样器 + 一致性损失） |
+| `ssl_tasks.py` | 创新 2：扩展自监督（掩码电压重建） |
 
 ## 模型输入 / 输出
 
@@ -40,10 +42,64 @@
 `--preload` 会把约 8 万条充电曲线读进内存（约 1 GB），耗时约 8 分钟，
 之后训练不再读 MAT。
 
+## 创新特性（本分支）
+
+在论文复现基线之上，本项目新增两个创新点，都通过命令行开关控制：
+
+### 创新 1：同循环一致性约束（`--consistency`）
+
+同一个循环可以切出最多 51 个部分充电片段，它们的 SOH 标签完全相同。
+一致性约束要求：同一循环的所有片段，模型输出必须彼此接近。
+
+```powershell
+& "E:\conda\envs\battery-soh\python.exe" "src/partial_soh/Trainer/trainer.py" `
+  --preload --consistency --pretrain-epochs 50 --finetune-epochs 50
+```
+
+可选参数：
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `--group-size` | 4 | 每个循环抽取 K 个片段组成一组 |
+| `--batch-groups` | 512 | 每批包含多少个循环（有效 batch = 512×4 = 2048） |
+| `--consist-lambda` | 1.0 | 一致性损失权重；设为 0 等于“只改采样、不加约束” |
+
+### 创新 2：扩展自监督（掩码电压重建，`--recon-loss`）
+
+在原版“下一步电压预测”之外，随机遮掉 30% 的电压点，让模型用上下文
+把它们重建出来，迫使编码器理解电压曲线的平滑结构与 LFP 电压平台。
+
+```powershell
+& "E:\conda\envs\battery-soh\python.exe" "src/partial_soh/Trainer/trainer.py" `
+  --preload --recon-loss --pretrain-epochs 50 --finetune-epochs 50
+```
+
+可选参数：`--mask-ratio`（默认 0.3）、`--recon-lambda`（默认 1.0）。
+
+### 消融实验设计
+
+| 配置 | 采样方式 | 损失项 | 说明 |
+| --- | --- | --- | --- |
+| 基线（论文复现） | 普通 shuffle | 数据损失 | 不加任何创新 |
+| 只改采样（对照） | 循环分组 | 数据损失 | `--consistency --consist-lambda 0` |
+| + 同循环一致性 | 循环分组 | 数据 + 一致性 | `--consistency` |
+| + 扩展自监督 | 普通 shuffle | 数据 + 重建 | `--recon-loss` |
+| 完整方案 | 循环分组 | 数据 + 一致性 + 重建 | 两个开关都开 |
+
+建议先用小规模冒烟测试确认数值正常，再做全量消融：
+
+```powershell
+& "E:\conda\envs\battery-soh\python.exe" "src/partial_soh/Trainer/trainer.py" `
+  --max-samples 3000 --batch-size 256 --pretrain-epochs 1 --finetune-epochs 1 `
+  --consistency --group-size 2 --batch-groups 16 --recon-loss
+```
+
 ## 当前简化（后续补齐）
 
 - 预训练目标当前是“观测窗内的下一步电压预测”。论文还提到 7% 容量的
   未来预测窗口，尚未接入；
+- 输入通道目前是 [I, V, Q]，尚未加入温度 T；等补充带温度变化的数据集
+  后，会把 T 作为第 4 通道接入，并用“跨温度验证”检验温度泛化能力；
 - 输入暂未做 z-score 标准化，V/I/Q 使用原始单位；
 - 梯度裁剪默认 1.0。论文 Table 1 写的是 0.0005，量级可疑，待对照补充材料
   后再决定是否严格采用；

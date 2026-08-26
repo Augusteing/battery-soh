@@ -109,6 +109,15 @@ class PartialSohDataset(Dataset):
         self.pred_end_ahs = index["pred_end_ah"].to_numpy(dtype=np.float32)
         self.soh_nominals = index["soh_nominal"].to_numpy(dtype=np.float32)
 
+        # 同循环一致性需要知道“哪些片段属于同一个循环”。
+        # 用 (cell_id, cycle_index) 分组并编号 0, 1, 2, ...，
+        # 同一循环的所有片段共享同一个编号。
+        self._group_ids = (
+            index.groupby(["cell_id", "cycle_index"], sort=False)
+            .ngroup()
+            .to_numpy(dtype=np.int64)
+        )
+
         # 预加载需要把全部曲线都留在缓存里，所以关闭 LRU 上限。
         if preload:
             cache_size = None
@@ -184,6 +193,14 @@ class PartialSohDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.cell_ids)
+
+    def group_ids(self) -> np.ndarray:
+        """返回每个样本所属循环的编号（int64 数组）。
+
+        同一个 (cell_id, cycle_index) 的所有片段共享同一个编号，
+        SameCycleBatchSampler 靠它把同循环片段聚到同一批次。
+        """
+        return self._group_ids
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """返回 (x, y)。
