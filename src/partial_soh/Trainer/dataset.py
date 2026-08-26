@@ -291,7 +291,13 @@ class MemmapSohDataset(Dataset):
         里按任务返回不同标签。
     """
 
-    def __init__(self, cache_dir: Path, split: str, task: str = "soh") -> None:
+    def __init__(
+        self,
+        cache_dir: Path,
+        split: str,
+        task: str = "soh",
+        in_memory: bool = True,
+    ) -> None:
         if task not in ("soh", "pretrain"):
             raise ValueError(f"task 必须是 'soh' 或 'pretrain'，得到 {task}")
         self.task = task
@@ -299,12 +305,23 @@ class MemmapSohDataset(Dataset):
 
         meta = json.loads((cache_dir / "meta.json").read_text(encoding="utf-8"))
         shape = tuple(int(v) for v in meta[f"shape_{split}"])  # (N, 101, 3)
-        self._x = np.memmap(
-            str(cache_dir / f"X_{split}.npy"),
-            dtype=np.float32,
-            mode="r",
-            shape=shape,
-        )
+        if in_memory:
+            # 一次性把整个片段矩阵读进 RAM（约 5 GB）。
+            # 训练时每个 step 都要随机取 4096 行；如果留在 memmap，
+            # 随机读取可能触发页面换入，CPU 仍会成为瓶颈。
+            # 载入内存后，随机访问稳定在内存速度。
+            # 注意：build_cache.py 用 np.memmap(mode="w+") 写的是裸二进制
+            # （没有 .npy 文件头），所以这里用 fromfile 读原始字节。
+            self._x = np.fromfile(
+                cache_dir / f"X_{split}.npy", dtype=np.float32
+            ).reshape(shape)
+        else:
+            self._x = np.memmap(
+                str(cache_dir / f"X_{split}.npy"),
+                dtype=np.float32,
+                mode="r",
+                shape=shape,
+            )
         self._y = np.load(cache_dir / f"y_{split}.npy")
         self._pretrain_mask = np.load(cache_dir / f"is_valid_pretrain_{split}.npy")
         self._group_ids = np.load(cache_dir / f"group_ids_{split}.npy")
@@ -351,8 +368,12 @@ class MemmapSohDataset(Dataset):
 
         返回
         ----
-        样本列表 [(x_i, y_i), ...]，交给 default_collate 组装成
-        (B, 101, 3) 与 (B,)（或 (B, 100)）张量。
+        已经堆叠好的 (x, y)：
+          x : (B, 101, 3)
+          y : (B,)（soh）或 (B, 100)（pretrain）
+
+        配合 trainer 里的 identity collate（collate_fn=lambda b: b），
+        DataLoader 直接把这个结果当作一个 batch，不再逐样本组装。
         """
         rows = self._valid[np.asarray(indices)]
         x = torch.from_numpy(np.array(self._x[rows]))  # (B, 101, 3)
@@ -360,7 +381,7 @@ class MemmapSohDataset(Dataset):
             y = torch.from_numpy(np.array(self._y[rows]))  # (B,)
         else:
             y = x[:, 1:, 1]  # (B, 100)
-        return [(x[i], y[i]) for i in range(len(rows))]
+        return x, y
 
 
 if __name__ == "__main__":

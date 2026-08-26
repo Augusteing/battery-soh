@@ -74,6 +74,29 @@ def _get_group_ids(ds) -> np.ndarray:
     return ds.group_ids()
 
 
+def _memmap_safe_collate(batch):
+    """兼容两种 batch 形态的 collate（配合 MemmapSohDataset）。
+
+    默认的 default_collate 会逐个样本地组装一个 4096 元素的列表，
+    Python 开销约 50~80ms/step。memmap 数据集已经在 __getitems__
+    里一次性堆叠成张量，所以可能收到两种输入：
+
+      1) (x, y) 已堆叠张量：batch[0] 形状 (B, 101, 3) —— 直接返回；
+      2) [(x_i, y_i), ...] 样本列表（如 Subset 逐样本回退）：
+         batch[0] 形状 (101, 3) —— 走 default_collate。
+
+    用 batch[0].ndim == 3 区分这两种情况。
+    """
+    if (
+        isinstance(batch, (tuple, list))
+        and len(batch) == 2
+        and torch.is_tensor(batch[0])
+        and batch[0].ndim == 3
+    ):
+        return batch
+    return torch.utils.data.default_collate(batch)
+
+
 def _ckpt_path(model_out: Path) -> Path:
     """checkpoint 文件与模型同目录、同名，后缀改为 .ckpt。"""
     return model_out.with_name(model_out.stem + ".ckpt")
@@ -399,12 +422,17 @@ def main() -> None:
         group_ids = _get_group_ids(soh_ds)
         print(f"一致性采样器：{len(group_ids)} 个片段，按循环分组")
 
+    # memmap 缓存模式：用安全 collate 让 __getitems__ 返回的整块张量
+    # 直接成为 batch（也兼容 Subset 冒烟测试的逐样本回退）。
+    collate_fn = _memmap_safe_collate if args.cache_dir is not None else None
+
     if not args.no_pretrain:
         pretrain_loader = DataLoader(
             pretrain_ds,
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=0,
+            collate_fn=collate_fn,
         )
     if args.consistency:
         # 用“循环分组”的批次采样器替代普通 shuffle：
@@ -421,13 +449,16 @@ def main() -> None:
             seed=config.seed + 1,
             steps_per_epoch=steps_per_epoch,
         )
-        soh_loader = DataLoader(soh_ds, batch_sampler=batch_sampler, num_workers=0)
+        soh_loader = DataLoader(
+            soh_ds, batch_sampler=batch_sampler, num_workers=0, collate_fn=collate_fn
+        )
     else:
         soh_loader = DataLoader(
             soh_ds,
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=0,
+            collate_fn=collate_fn,
         )
 
     model = PartialSohLSTM().to(device)
@@ -516,7 +547,11 @@ def main() -> None:
             args.index, args.mat_dir, split="test", task="soh", preload=True
         )
     test_loader = DataLoader(
-        test_ds, batch_size=config.batch_size, shuffle=False, num_workers=0
+        test_ds,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=_memmap_safe_collate if args.cache_dir is not None else None,
     )
     test_metrics = evaluate_soh(model, test_loader, device)
     print(f"  MAE  = {test_metrics['mae_pct']:.4f}%")
