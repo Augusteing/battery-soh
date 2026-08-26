@@ -197,6 +197,12 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=None, help="冒烟验证：每个配置只取前 N 个样本")
     parser.add_argument("--index", type=Path, default=ROOT / "data" / "processed" / "partial_segments_index.parquet")
     parser.add_argument("--mat-dir", type=Path, default=ROOT / "data" / "external" / "matr")
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=ROOT / "data" / "processed" / "segments_cache",
+        help="build_cache.py 生成的 memmap 缓存目录（训练提速，建议先用它构建）",
+    )
     parser.add_argument("--log-dir", type=Path, default=ROOT / "results" / "runs")
     parser.add_argument("--model-dir", type=Path, default=ROOT / "models")
     parser.add_argument("--out", type=Path, default=ROOT / "results" / "metrics" / "ablation_consistency_ssl.json")
@@ -212,6 +218,7 @@ def main() -> None:
         "--seed", str(args.seed),
         "--index", str(args.index),
         "--mat-dir", str(args.mat_dir),
+        "--cache-dir", str(args.cache_dir),
     ]
     if args.preload:
         common_args.append("--preload")

@@ -15,6 +15,8 @@
 | `trainer.py` | 预训练 + 微调 + 评估的入口 |
 | `consistency.py` | 创新 1：同循环一致性约束（分组采样器 + 一致性损失） |
 | `ssl_tasks.py` | 创新 2：扩展自监督（掩码电压重建） |
+| `build_cache.py` | 把全部片段一次性物化到磁盘 memmap（训练提速） |
+| `run_ablation.py` | 一键顺序跑 5 个消融配置并汇总指标/画图 |
 | `run_ablation.py` | 消融实验驱动器：顺序跑 5 个配置并汇总 MAE/RMSE |
 
 ## 模型输入 / 输出
@@ -109,6 +111,25 @@
   --max-samples 3000 --batch-size 256 --pretrain-epochs 1 --finetune-epochs 1 `
   --consistency --group-size 2 --batch-groups 16 --recon-loss
 ```
+
+## 磁盘缓存（推荐，训练提速）
+
+训练时每个 batch 都要在 CPU 上把几千个片段插值到 101 点容量网格，
+CPU 成为瓶颈（实测约 0.25s/step，一个 epoch 超过 5 分钟）。
+片段是静态数据，可以一次性物化到磁盘：
+
+```powershell
+# 先构建 train 与 test 的缓存（各约 15 / 3 分钟，共约 6 GB）
+& "E:\conda\envs\battery-soh\python.exe" "src/partial_soh/Trainer/build_cache.py" --split train
+& "E:\conda\envs\battery-soh\python.exe" "src/partial_soh/Trainer/build_cache.py" --split test
+
+# 之后训练加 --cache-dir 即可直接读缓存（跳过 MAT 读取与插值）
+& "E:\conda\envs\battery-soh\python.exe" "src/partial_soh/Trainer/trainer.py" `
+  --cache-dir "data/processed/segments_cache" `
+  --consistency --recon-loss --pretrain-epochs 10 --finetune-epochs 10
+```
+
+`run_ablation.py` 默认就会带上 `--cache-dir`，只要先构建过缓存即可。
 
 ## 当前简化（后续补齐）
 

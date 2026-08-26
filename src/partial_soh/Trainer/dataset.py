@@ -20,7 +20,9 @@
 
 from __future__ import annotations
 
+import json
 import sys
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 
@@ -39,6 +41,43 @@ if str(DL_DIR) not in sys.path:
 from mat_io import discover_batch_files, read_raw_cycle_from_file  # noqa: E402
 from charge import extract_charge_curve  # noqa: E402
 from segments import interpolate_segment, NOMINAL_CAPACITY_AH  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# 进程内共享充电曲线缓存
+# ---------------------------------------------------------------------------
+# 同一个训练进程里会创建多个 Dataset 实例（如 soh 任务与 pretrain 任务），
+# 它们需要读取的是同一批充电曲线。如果不共享缓存，每条曲线会被重复
+# 读取/提取一次，预加载时间翻倍。这里用模块级 LRU 缓存存一份，
+# 所有实例共用；上限设成能容纳 train + test 全部唯一曲线的数量级，
+# 非预加载模式下也不会无限增长。
+# ---------------------------------------------------------------------------
+_SHARED_CACHE_MAX = 200_000
+_SHARED_CHARGE_CACHE: OrderedDict[
+    tuple[str, int, int],
+    tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+] = OrderedDict()
+
+
+def _shared_cache_get(
+    key: tuple[str, int, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """取共享缓存；命中时把 key 移到队尾（LRU 语义）。"""
+    value = _SHARED_CHARGE_CACHE.get(key)
+    if value is not None:
+        _SHARED_CHARGE_CACHE.move_to_end(key)
+    return value
+
+
+def _shared_cache_put(
+    key: tuple[str, int, int],
+    value: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+) -> None:
+    """写入共享缓存；超过上限时淘汰最久未使用的条目。"""
+    _SHARED_CHARGE_CACHE[key] = value
+    _SHARED_CHARGE_CACHE.move_to_end(key)
+    while len(_SHARED_CHARGE_CACHE) > _SHARED_CACHE_MAX:
+        _SHARED_CHARGE_CACHE.popitem(last=False)
 
 
 def _cell_index_from_id(cell_id: str) -> int:
@@ -154,17 +193,25 @@ class PartialSohDataset(Dataset):
         if batch not in self.files:
             raise FileNotFoundError(f"找不到批次文件: {batch}")
 
+        # 先查进程内共享缓存：soh 任务读过的曲线，pretrain 任务直接复用。
+        key = (batch, cell_index, int(cycle_index))
+        cached = _shared_cache_get(key)
+        if cached is not None:
+            return cached
+
         raw = read_raw_cycle_from_file(
             self._handles[batch], cell_index, int(cycle_index)
         )
         charge = extract_charge_curve(raw)
-        return (
+        value = (
             np.asarray(charge["t"], dtype=np.float32),
             np.asarray(charge["V"], dtype=np.float32),
             np.asarray(charge["I"], dtype=np.float32),
             np.asarray(charge["T"], dtype=np.float32),
             np.asarray(charge["Qc"], dtype=np.float32),
         )
+        _shared_cache_put(key, value)
+        return value
 
     def close(self) -> None:
         """关闭所有已打开的 MAT 文件句柄（幂等）。"""
@@ -227,6 +274,70 @@ class PartialSohDataset(Dataset):
             y = x[1:, 1]
 
         return torch.from_numpy(x), torch.from_numpy(y)
+
+
+class MemmapSohDataset(Dataset):
+    """从磁盘 memmap 缓存直接读取片段（训练提速用）。
+
+    背景
+    ----
+    片段是静态数据：同一个片段每次插值结果完全一样。`build_cache.py`
+    一次性把全部片段插值好写入磁盘，本类只做“按行切片 + 转张量”。
+    训练时 CPU 几乎不干活，瓶颈回到 GPU。
+
+    与 PartialSohDataset 的区别：
+      - 不做 MAT 读取、不做插值（都已在构建缓存时完成）；
+      - 两个任务（soh / pretrain）共享同一份输入，只在 __getitem__
+        里按任务返回不同标签。
+    """
+
+    def __init__(self, cache_dir: Path, split: str, task: str = "soh") -> None:
+        if task not in ("soh", "pretrain"):
+            raise ValueError(f"task 必须是 'soh' 或 'pretrain'，得到 {task}")
+        self.task = task
+        cache_dir = Path(cache_dir)
+
+        meta = json.loads((cache_dir / "meta.json").read_text(encoding="utf-8"))
+        shape = tuple(int(v) for v in meta[f"shape_{split}"])  # (N, 101, 3)
+        self._x = np.memmap(
+            str(cache_dir / f"X_{split}.npy"),
+            dtype=np.float32,
+            mode="r",
+            shape=shape,
+        )
+        self._y = np.load(cache_dir / f"y_{split}.npy")
+        self._pretrain_mask = np.load(cache_dir / f"is_valid_pretrain_{split}.npy")
+        self._group_ids = np.load(cache_dir / f"group_ids_{split}.npy")
+
+        if task == "pretrain":
+            # 预训练任务只需要“拥有完整 7% 预测窗口”的片段。
+            self._valid = np.flatnonzero(self._pretrain_mask)
+        else:
+            # SOH 任务：缓存里全是 is_valid_soh 的片段，全部可用。
+            self._valid = np.arange(len(self._y))
+
+    def __len__(self) -> int:
+        return len(self._valid)
+
+    def group_ids(self) -> np.ndarray:
+        """返回每个样本所属循环的编号（int64）。
+
+        与 PartialSohDataset.group_ids 语义一致，供同循环一致性采样使用。
+        """
+        return self._group_ids
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """返回 (x, y)，形状与 PartialSohDataset 完全一致。"""
+        row = int(self._valid[idx])
+        # np.array(...) 会拷贝一份普通可写 ndarray，
+        # 避免 torch.from_numpy 对只读 memmap 的警告。
+        x = torch.from_numpy(np.array(self._x[row]))  # (101, 3)
+        if self.task == "soh":
+            y = torch.from_numpy(np.asarray(self._y[row]))  # 标量 SOH
+        else:
+            # 与 PartialSohDataset 一致：下一步电压 V[1:101]。
+            y = x[1:, 1]
+        return x, y
 
 
 if __name__ == "__main__":

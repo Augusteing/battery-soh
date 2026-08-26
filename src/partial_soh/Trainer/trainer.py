@@ -35,7 +35,7 @@ from consistency import (  # noqa: E402
     SameCycleBatchSampler,
     same_cycle_consistency_loss,
 )
-from dataset import PartialSohDataset  # noqa: E402
+from dataset import MemmapSohDataset, PartialSohDataset  # noqa: E402
 from model import PartialSohLSTM  # noqa: E402
 from ssl_tasks import mask_voltage, masked_reconstruction_loss  # noqa: E402
 
@@ -278,6 +278,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--index", type=Path, default=ROOT / "data" / "processed" / "partial_segments_index.parquet")
     parser.add_argument("--mat-dir", type=Path, default=ROOT / "data" / "external" / "matr")
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="若提供，则从 build_cache.py 生成的 memmap 缓存直接读数据（训练提速）",
+    )
     parser.add_argument("--batch-size", type=int, default=20000)
     parser.add_argument("--pretrain-epochs", type=int, default=50)
     parser.add_argument("--finetune-epochs", type=int, default=50)
@@ -362,13 +368,24 @@ def main() -> None:
         print(f"  重建: mask_ratio={args.mask_ratio}, λ={args.recon_lambda}")
 
     # 两个任务各建一个 Dataset，都用 train 划分。直接训练模式不需要预训练数据集。
-    soh_ds = PartialSohDataset(
-        args.index, args.mat_dir, split="train", task="soh", preload=args.preload
-    )
-    if not args.no_pretrain:
-        pretrain_ds = PartialSohDataset(
-            args.index, args.mat_dir, split="train", task="pretrain", preload=args.preload
+    if args.cache_dir is not None:
+        print(f"数据源: memmap 缓存 {args.cache_dir}（跳过 MAT 读取与插值）")
+        soh_ds = MemmapSohDataset(args.cache_dir, split="train", task="soh")
+        if not args.no_pretrain:
+            pretrain_ds = MemmapSohDataset(args.cache_dir, split="train", task="pretrain")
+    else:
+        print(f"数据源: 惰性读取 {args.mat_dir}")
+        soh_ds = PartialSohDataset(
+            args.index, args.mat_dir, split="train", task="soh", preload=args.preload
         )
+        if not args.no_pretrain:
+            pretrain_ds = PartialSohDataset(
+                args.index,
+                args.mat_dir,
+                split="train",
+                task="pretrain",
+                preload=args.preload,
+            )
 
     if args.max_samples is not None:
         n = min(args.max_samples, len(soh_ds))
@@ -492,9 +509,12 @@ def main() -> None:
     print(f"  RMSE = {train_metrics['rmse_pct']:.4f}%")
 
     print("\n== 测试集评估 ==")
-    test_ds = PartialSohDataset(
-        args.index, args.mat_dir, split="test", task="soh", preload=True
-    )
+    if args.cache_dir is not None:
+        test_ds = MemmapSohDataset(args.cache_dir, split="test", task="soh")
+    else:
+        test_ds = PartialSohDataset(
+            args.index, args.mat_dir, split="test", task="soh", preload=True
+        )
     test_loader = DataLoader(
         test_ds, batch_size=config.batch_size, shuffle=False, num_workers=0
     )
