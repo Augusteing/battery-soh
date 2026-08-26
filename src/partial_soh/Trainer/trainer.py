@@ -184,9 +184,10 @@ def pretrain_voltage(
             # 损失 1：观测窗内“下一步电压”的密集监督。
             # 除以 accum_steps：累积 N 步后再更新，等效于大 batch。
             loss = loss_fn(pred[:, :-1], y) / accum_steps
-            # 损失 2：未来 7% 容量窗的自回归电压预测（论文对齐）。
-            rollout = model.voltage_rollout(x, x_future)  # (B, 36)
-            future_loss_val = loss_fn(rollout, x_future[:, :, 1])
+            # 损失 2：未来 7% 容量窗的电压预测（论文对齐）。
+            # 直接从最终状态预测整条未来曲线，监督 = 未来窗真实电压。
+            future_pred = model.future_predict(x)  # (B, 36)
+            future_loss_val = loss_fn(future_pred, x_future[:, :, 1])
             loss = loss + future_loss_val / accum_steps
             if recon_lambda > 0:
                 # 1) 随机遮掉 mask_ratio 比例的电压点；
