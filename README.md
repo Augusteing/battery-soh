@@ -10,21 +10,33 @@
 
 ## 当前进展
 
-### A 基线（SOH 估计，已完成）
+### 主线：片段级在线 SOH 估计（`src/partial_soh/`，进行中）
 
-- 数据：MATR 快速充电数据集（Severson et al., *Nature Energy* 2019，A123 LFP/graphite），batch 20170512 共 46 只电池、23 种快充协议；
-- 数据处理：逐循环 SOH 标签表（化成循环剔除、前 10 循环中位数归一化）；
-- 特征工程：15 个逐循环特征（时序位置 / 当前观测 / 派生量 / 历史滚动窗口四类，只用过去信息）；
-- 模型：Ridge（线性对照）与 HistGradientBoostingRegressor（主力）；
-- 验证：按电池分组 5 折 / 按协议分组 5 折 / 时间切分三种方案；
-- 结果：跨电池 MAE 0.52%、跨协议 MAE 0.59%（R²≈0.90）；时间外推 MAE 5.21%（暴露逐点回归无法外推的短板，作为 B 方案对照）；
-- 演示 notebook：`notebooks/01_matr_a_baseline.ipynb`（数据集协议 → 数据处理 → 特征 → 模型 → 验证 → 结果，已预执行）。
+复现 Scientific Reports 2026（DOI 10.1038/s41598-026-48906-4）的迁移学习方案：
+LSTM 先做“下一步电压预测”自监督预训练，再微调 SOH 回归头；模型输入是
+部分充电片段（拿到当前充电片段即可在线估计，不需要完整循环）。
 
-### B 方案（SOH 预测，进行中）
+- 数据：Severson et al. (2019) LFP 快速充电数据集（MATR，A123 18650，1.1 Ah）；
+  按 Severson 2019 口径排除坏电池后剩 124 只，再排除 1 只短寿命电池，共 123 只；
+- 片段：每个循环在 0%–50% 额定容量区间内以 1% 步长滑动 20% 容量窗口，
+  重采样到 101 点，输入通道 [I, V, Q]；SOH 标签 = 充电容量 / 1.1；
+- 基线结果（10 预训练 + 10 微调 epoch，测试集）：
+  - 迁移学习 LSTM：MAE **1.80%**、RMSE 2.35%；
+  - 直接训练 LSTM（对照）：MAE **1.87%**、RMSE 2.43%；
+  - 论文报告（50+50 epoch）：迁移 0.91% / 1.30%，直接 1.75% / 2.35%。
 
-- 任务设定（已与导师确认）：**在线滚动前瞻**——用第 t 个循环及之前的数据，预测第 t+Δ 个循环的 SOH（Δ=50/100/200），并配套早期寿命（RUL）预测；
-- 路线：移位标签回归基线（误差 vs 预测距离曲线）→ 退化趋势建模外推（幂律/拐点）→ 序列模型（LSTM/GRU/Transformer）→ 不确定性量化（GPR/分位数回归）；
-- 数据扩展：MATR 其余批次、Stanford 动态循环数据集（NCA，动态工况验证）。
+### 创新：同循环一致性 + 扩展自监督（分支 `codex/feature/consistency-ssl`）
+
+- 创新 1（同循环一致性约束）：同一循环切出的多个片段共享同一个 SOH，
+  用分组采样 + 组内方差损失让模型输出彼此一致；
+- 创新 2（扩展自监督）：在原“下一步电压预测”之外增加掩码电压重建任务；
+- 消融驱动脚本 `run_ablation.py` 已跑通冒烟验证，5 配置全量消融进行中
+  （结果将写入 `results/metrics/ablation_consistency_ssl.json`）。
+
+### 世界模型复现（旧主线，独立保留 `src/world_model/`）
+
+arXiv 2603.10527：完整循环 V/I/T -> 1D-CNN 循环编码器 -> PatchTST -> 动力学
+滚动预测未来 80 个循环 SOH（W=30, H=80）。与片段级主线数据口径分开，不再混用。
 
 ## 目录结构
 
@@ -34,17 +46,20 @@ battery-soh/
 │   ├── raw/               # 原始数据（实车/台架采集，只读）
 │   ├── interim/           # 清洗、对齐等中间产物
 │   ├── processed/         # 可直接用于训练/标定的最终数据
-│   └── external/          # 外部公开数据集（MATR、Stanford 等）
-├── docs/                  # 项目文档（比赛方案、调研笔记、论文）
+│   └── external/          # 外部公开数据集（MATR 等）
+├── docs/                  # 项目文档（比赛方案、调研笔记、论文与翻译）
 ├── models/                # 训练好的模型权重（不入库）
 ├── notebooks/             # 演示与分析 notebook
 ├── references/            # 参考文献与资料
 ├── reports/               # 技术报告（比赛交付物）及图表素材
 ├── results/               # 实验输出（不入库）
 │   ├── figures/           # 图表
-│   └── metrics/           # 指标记录（JSON/CSV）
-├── scripts/               # 可执行脚本（数据流水线、训练、评估入口）
-├── src/battery_soh/       # 核心代码包（部分为空壳，待 B 方案重构）
+│   ├── metrics/           # 指标记录（JSON）
+│   └── runs/              # 训练日志
+├── scripts/               # 通用脚本（数据探索、绘图）
+├── src/
+│   ├── partial_soh/       # 当前主线：片段级在线 SOH（DataLoader / Trainer）
+│   └── world_model/       # 世界模型复现（旧主线，独立保留）
 └── tests/                 # 单元测试
 ```
 
@@ -56,45 +71,47 @@ battery-soh/
 conda activate battery-soh
 ```
 
-依赖：pandas、numpy、scikit-learn、pyarrow、h5py、matplotlib、nbformat、nbclient、ipykernel。
+依赖：pytorch、pandas、numpy、scikit-learn、pyarrow、h5py、matplotlib、nbformat、nbclient、ipykernel。
 
 ## 数据流水线
 
 ### 数据获取
 
-MATR 批次文件体积较大（约 3 GB/批），从官网直链手动下载后放入：
+Severson LFP 数据集（MATR，3 个批次共 140 个通道）从官网直链手动下载后放入：
 
 ```
-data/external/matr/MATR_batch_20170512.mat
+data/external/matr/
 ```
 
 > 数据、模型权重等大文件不入库（见 `.gitignore`）。
 
-### 处理与建模（A 基线）
+### 处理与训练（主线 partial_soh）
 
 ```powershell
-# 1. 逐循环 SOH 标签表 -> data/processed/matr_soh_table.parquet
-python scripts/build_matr_soh_table.py
+# 1. 构建片段索引（labels -> splits -> segments）
+#    -> data/processed/partial_segments_index.parquet
+python src/partial_soh/DataLoader/build_dataset.py
 
-# 2. 特征工程 -> data/processed/matr_features.parquet
-python scripts/build_matr_features.py
+# 2. 训练（电压预测预训练 + SOH 微调）
+& "E:\conda\envs\battery-soh\python.exe" "src/partial_soh/Trainer/trainer.py" `
+  --preload --pretrain-epochs 50 --finetune-epochs 50
 
-# 3. 训练与评估 -> results/metrics + results/figures
-python scripts/train_baseline.py
-
-# 4. SOH 轨迹总览图
-python scripts/plot_matr_soh_overview.py
-
-# 5. 重新生成演示 notebook（内容修改后）
-python scripts/make_baseline_notebook.py --out notebooks/01_matr_a_baseline.ipynb
+# 3. 消融实验（5 配置：基线 / 只改采样 / 一致性 / 重建 / 完整方案）
+& "E:\conda\envs\battery-soh\python.exe" "src/partial_soh/Trainer/run_ablation.py" `
+  --epochs 10 --preload
 ```
 
 ## 技术路线
 
-1. **A 基线（完成）**：逐点回归估计当前 SOH，建立指标管道与对照基准；
-2. **B 方案（进行中）**：在线滚动前瞻预测未来 SOH——先移位标签基线，再退化趋势外推，再序列模型，最后不确定性量化；
-3. **数据扩展**：MATR 其余批次（扩大 LFP 样本量）、Stanford 动态循环数据集（NCA，动态工况鲁棒性验证，报告中注明化学体系差异）；
-4. 最终以技术报告 + 答辩 PPT 交付。
+1. **片段级在线 SOH 估计（主线）**：部分充电片段 -> 共享 LSTM 编码器
+   （“下一步电压预测”自监督预训练）-> SOH 回归头；
+2. **创新 1（同循环一致性约束）**：同一循环的多个片段输出彼此一致，
+   缓解单片段观测噪声，把稀疏的逐循环监督变成组内稠密约束；
+3. **创新 2（扩展自监督）**：掩码电压重建，增强编码器对 LFP 电压平台
+   与曲线平滑结构的表征；
+4. **数据扩展（待接入）**：补充带温度变化的 LFP 数据集
+   （SNL/Preger、UMR AMPERE 等），增加温度输入通道并做跨温度验证；
+5. 最终以技术报告 + 答辩 PPT 交付。
 
 ## 关键节点
 
@@ -104,9 +121,9 @@ python scripts/make_baseline_notebook.py --out notebooks/01_matr_a_baseline.ipyn
 
 ## 数据集与引用
 
-- MATR 快速充电数据集（LFP，124 只）：Severson, K.A. et al. Data-driven prediction of battery cycle life before capacity degradation. *Nature Energy* (2019). <https://data.matr.io/>
-- Stanford 动态循环数据集（NCA，92 只）：Geslin, A., Xu, L., Ganapathi, D. et al. Dynamic cycling enhances battery lifetime. *Nat Energy* (2024). <https://purl.stanford.edu/td676xr4322>
-- 免诊断车载健康评估（B 方案对标方法）：Che, Y. et al. Diagnostic-free onboard battery health assessment. *Joule* 9, 102010 (2025).
+- Severson LFP 快速充电数据集（MATR，124 只可用）：Severson, K.A. et al. Data-driven prediction of battery cycle life before capacity degradation. *Nature Energy* (2019). <https://data.matr.io/>
+- 片段级 SOH 估计（复现对象）：*Scientific Reports* (2026)，DOI 10.1038/s41598-026-48906-4（原文 PDF 与中文翻译见 `docs/papers/`）
+- 世界模型（复现对象，旧主线）：arXiv 2603.10527（完整循环 -> PatchTST -> 未来 SOH 滚动预测）
 
 使用上述数据集发表成果时请按各自要求引用原文。
 
