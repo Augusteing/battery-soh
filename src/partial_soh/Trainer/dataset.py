@@ -339,6 +339,29 @@ class MemmapSohDataset(Dataset):
             y = x[1:, 1]
         return x, y
 
+    def __getitems__(self, indices: list[int]) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """批量读取（PyTorch 2.1+ 的 DataLoader 会优先调用本方法）。
+
+        作用
+        ----
+        默认情况下 DataLoader 会逐个调用 __getitem__ 取 4096 个样本，
+        每个样本都有一次 Python 层开销（约 30μs），合计每步 100ms+，
+        CPU 成为瓶颈。这里用 numpy 的 fancy indexing 一次性取出整个
+        batch（高级索引本身就会拷贝），把 4096 次调用降成 1 次。
+
+        返回
+        ----
+        样本列表 [(x_i, y_i), ...]，交给 default_collate 组装成
+        (B, 101, 3) 与 (B,)（或 (B, 100)）张量。
+        """
+        rows = self._valid[np.asarray(indices)]
+        x = torch.from_numpy(np.array(self._x[rows]))  # (B, 101, 3)
+        if self.task == "soh":
+            y = torch.from_numpy(np.array(self._y[rows]))  # (B,)
+        else:
+            y = x[:, 1:, 1]  # (B, 100)
+        return [(x[i], y[i]) for i in range(len(rows))]
+
 
 if __name__ == "__main__":
     """冒烟测试：取 train 前 3 个样本，打印形状与数值。"""

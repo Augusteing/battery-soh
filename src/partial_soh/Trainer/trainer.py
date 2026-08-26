@@ -147,10 +147,10 @@ def pretrain_voltage(
             x = x.to(device)
             y = y.to(device)  # y 形状 (B, 100)，是 V[1:101]
 
+            recon_loss_val = 0.0
             pred = model.voltage_predict(x)  # (B, 101)
             # 只用前 100 步和下一步电压比较。
             loss = loss_fn(pred[:, :-1], y)
-            recon_loss_val = 0.0
             if recon_lambda > 0:
                 # 1) 随机遮掉 mask_ratio 比例的电压点；
                 # 2) 用损坏后的输入走一次前向，重建被遮住的电压；
@@ -216,9 +216,9 @@ def finetune_soh(
             x = x.to(device)
             y = y.to(device)  # y 形状 (B,)
 
+            consist_val = 0.0
             pred = model.soh_predict(x)  # (B,)
             loss = loss_fn(pred, y)
-            consist_val = 0.0
             if consist_lambda > 0:
                 # 批次由 SameCycleBatchSampler 构成：每 G 组、每组是
                 # 同一循环的 K 个片段。把预测 reshape 成 (G, K)，
