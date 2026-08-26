@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -391,11 +392,17 @@ def main() -> None:
     if args.consistency:
         # 用“循环分组”的批次采样器替代普通 shuffle：
         # 每个批次 = batch_groups 个循环 × group_size 个同循环片段。
+        # steps_per_epoch 与普通模式的更新次数对齐（按样本数折算），
+        # 保证消融对比公平。
+        steps_per_epoch = math.ceil(
+            len(soh_ds) / (args.batch_groups * args.group_size)
+        )
         batch_sampler = SameCycleBatchSampler(
             group_ids,
             group_size=args.group_size,
             batch_groups=args.batch_groups,
             seed=config.seed + 1,
+            steps_per_epoch=steps_per_epoch,
         )
         soh_loader = DataLoader(soh_ds, batch_sampler=batch_sampler, num_workers=0)
     else:

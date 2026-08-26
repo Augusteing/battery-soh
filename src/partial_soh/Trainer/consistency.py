@@ -59,9 +59,10 @@ class SameCycleBatchSampler(Sampler[list[int]]):
     seed        : 随机种子，保证可复现。
 
     注意：epoch 的定义和普通训练不同。普通训练一个 epoch 覆盖所有片段；
-    这里一个 epoch 覆盖所有“片段数 >= K 的循环”，每个循环只贡献
-    K 个片段（随机抽）。因此单个 epoch 的更新次数更少，但每个循环都会
-    被一致性地观测到。
+    这里每个循环只贡献 K 个片段（随机抽）。
+    为了消融公平，trainer 会显式传入 steps_per_epoch（= 普通模式的
+    更新次数），让每个 epoch 的总样本量与普通训练对齐——不同配置只差
+    “采样方式 / 损失项”，不差“看到的数据量”。
     """
 
     def __init__(
@@ -70,11 +71,14 @@ class SameCycleBatchSampler(Sampler[list[int]]):
         group_size: int = 4,
         batch_groups: int = 512,
         seed: int = 0,
+        steps_per_epoch: int | None = None,
     ) -> None:
         if group_size < 2:
             raise ValueError("group_size 至少为 2，否则无法计算组内一致性")
         if batch_groups < 1:
             raise ValueError("batch_groups 至少为 1")
+        if steps_per_epoch is not None and steps_per_epoch < 1:
+            raise ValueError("steps_per_epoch 至少为 1")
 
         self.group_size = int(group_size)
         self.batch_groups = int(batch_groups)
@@ -98,8 +102,14 @@ class SameCycleBatchSampler(Sampler[list[int]]):
             )
 
         self.cycle_keys = list(self.cycles.keys())
-        # 一个 epoch 的迭代次数 ≈ 循环数 / 每批循环数。
-        self.n_batches = max(1, ceil(len(self.cycle_keys) / self.batch_groups))
+        # 一个 epoch 的迭代次数：
+        #   - 默认：循环数 / 每批循环数（每个循环每 epoch 出现一次）；
+        #   - 显式指定 steps_per_epoch：与普通训练对齐，
+        #     保证消融实验里“每个 epoch 看到的总样本数相同”。
+        if steps_per_epoch is None:
+            self.n_batches = max(1, ceil(len(self.cycle_keys) / self.batch_groups))
+        else:
+            self.n_batches = int(steps_per_epoch)
 
     def __iter__(self):
         """每个批次：有放回地抽 G 个循环，每个循环无放回地抽 K 个片段。"""
