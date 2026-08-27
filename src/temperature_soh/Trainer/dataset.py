@@ -68,16 +68,21 @@ _ARRAY_CACHE: dict[tuple[str, str], np.ndarray] = {}
 
 
 def _load_shared_array(
-    cache_dir: Path, split: str, kind: str, shape: tuple[int, ...]
+    cache_dir: Path, split: str, kind: str, n_rows: int, channels: int
 ) -> np.ndarray:
-    """按 (split, kind) 加载一次并缓存；kind: "x" 或 "future"。"""
-    key = (split, kind)
+    """按 (split, kind, channels) 加载一次并缓存；kind: "x" 或 "future"。"""
+    key = (split, kind, channels)
     arr = _ARRAY_CACHE.get(key)
     if arr is None:
         name = "X" if kind == "x" else "X_future"
+        # 磁盘缓存固定是 4 通道（101 或 36 点），先按完整形状加载再切片。
+        n_points = 101 if kind == "x" else 36
         arr = np.fromfile(
             cache_dir / f"{name}_{split}.npy", dtype=np.float32
-        ).reshape(shape)
+        ).reshape(n_rows, n_points, 4)
+        # 3 通道对照：缓存是 4 通道，只需切掉温度通道（最后一位）。
+        if channels < arr.shape[-1]:
+            arr = arr[..., :channels]
         _ARRAY_CACHE[key] = arr
     return arr
 
@@ -111,6 +116,7 @@ class TemperatureSohDataset(Dataset):
         task: str = "soh",
         cache_size: int | None = 8192,
         preload: bool = False,
+        channels: int = 4,
     ) -> None:
         """初始化数据集。
 
@@ -126,8 +132,11 @@ class TemperatureSohDataset(Dataset):
         """
         if task not in ("soh", "pretrain"):
             raise ValueError(f"task 必须是 'soh' 或 'pretrain'，得到 {task}")
+        if channels not in (3, 4):
+            raise ValueError(f"channels 必须是 3 或 4，得到 {channels}")
 
         self.task = task
+        self.channels = channels
         self.mat_dir = Path(mat_dir)
         self.files = discover_batch_files(self.mat_dir)
         # 一次性打开所有批次文件并复用句柄，避免每条曲线都重新 open/close。
@@ -249,6 +258,9 @@ class TemperatureSohDataset(Dataset):
             ],
             axis=1,
         ).astype(np.float32)
+        # 3 通道对照：只保留 [I, V, Q]，切掉温度通道。
+        if self.channels < x.shape[1]:
+            x = x[:, : self.channels]
         return x
 
     def _interpolate_pred_window(
@@ -321,25 +333,32 @@ class MemmapSohDataset(Dataset):
         split: str,
         task: str = "soh",
         in_memory: bool = True,
+        channels: int = 4,
     ) -> None:
         if task not in ("soh", "pretrain"):
             raise ValueError(f"task 必须是 'soh' 或 'pretrain'，得到 {task}")
+        if channels not in (3, 4):
+            raise ValueError(f"channels 必须是 3 或 4，得到 {channels}")
         self.task = task
+        self.channels = channels
         cache_dir = Path(cache_dir)
 
         meta = json.loads((cache_dir / "meta.json").read_text(encoding="utf-8"))
         shape = tuple(int(v) for v in meta[f"shape_{split}"])  # (N, 101, 4)
+        shape = shape[:-1] + (channels,)  # 按需要切成 (N, 101, 3) 或 (N, 101, 4)
         if in_memory:
             # 一次性把整个片段矩阵读进 RAM（约 5 GB），多个 Dataset 共享
             # 同一份数组，避免 soh/pretrain 各复制一份导致内存翻倍。
-            self._x = _load_shared_array(cache_dir, split, "x", shape)
+            self._x = _load_shared_array(
+                cache_dir, split, "x", shape[0], channels
+            )
         else:
             self._x = np.memmap(
                 str(cache_dir / f"X_{split}.npy"),
                 dtype=np.float32,
                 mode="r",
-                shape=shape,
-            )
+                shape=(shape[0], 101, 4),
+            )[..., :channels]
         self._y = np.load(cache_dir / f"y_{split}.npy")
         self._pretrain_mask = np.load(cache_dir / f"is_valid_pretrain_{split}.npy")
         self._group_ids = np.load(cache_dir / f"group_ids_{split}.npy")
@@ -347,17 +366,18 @@ class MemmapSohDataset(Dataset):
         if task == "pretrain":
             # 未来 7% 预测窗（36 点），只在预训练任务需要时载入。
             future_shape = tuple(int(v) for v in meta[f"shape_future_{split}"])
+            future_shape = future_shape[:-1] + (channels,)
             if in_memory:
                 self._x_future = _load_shared_array(
-                    cache_dir, split, "future", future_shape
+                    cache_dir, split, "future", future_shape[0], channels
                 )
             else:
                 self._x_future = np.memmap(
                     str(cache_dir / f"X_future_{split}.npy"),
                     dtype=np.float32,
                     mode="r",
-                    shape=future_shape,
-                )
+                    shape=(future_shape[0], 36, 4),
+                )[..., :channels]
 
         if task == "pretrain":
             # 预训练任务只需要“拥有完整 7% 预测窗口”的片段。
@@ -393,13 +413,13 @@ class MemmapSohDataset(Dataset):
         配合 trainer 里的 identity collate 使用。
         """
         rows = self._valid[np.asarray(indices)]
-        x = torch.from_numpy(np.array(self._x[rows]))  # (B, 101, 4)
+        # fancy indexing 本身就会拷贝出新数组；in_memory 模式下
+        # _x 是普通可写数组，无需再包一层 np.array()。
+        x = torch.from_numpy(self._x[rows])  # (B, 101, 4)
         if self.task == "soh":
-            y = torch.from_numpy(np.array(self._y[rows]))  # (B,)
+            y = torch.from_numpy(np.asarray(self._y[rows]))  # (B,)
             return x, y
         else:
             y = x[:, 1:, 1]  # (B, 100)
-            x_future = torch.from_numpy(
-                np.array(self._x_future[rows])
-            )  # (B, 36, 4)
+            x_future = torch.from_numpy(self._x_future[rows])  # (B, 36, 4)
             return x, y, x_future

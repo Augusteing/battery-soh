@@ -268,6 +268,8 @@ def main() -> None:
                         help="预加载充电曲线到内存（全量训练建议开启）")
     parser.add_argument("--resume", action="store_true",
                         help="从 --out 同名 .ckpt 断点续训")
+    parser.add_argument("--channels", type=int, default=4, choices=(3, 4),
+                        help="输入通道数：4=带温度 (I,V,Q,T)，3=无温度 (I,V,Q) 对照")
     args = parser.parse_args()
 
     cache_dir = Path(args.cache_dir) if args.cache_dir is not None else DEFAULT_CACHE_DIR
@@ -291,11 +293,13 @@ def main() -> None:
     print("阶段 1：电压预测预训练（4 通道）")
     print("=" * 60)
     if use_cache:
-        pretrain_ds = MemmapSohDataset(cache_dir, split="train", task="pretrain")
+        pretrain_ds = MemmapSohDataset(
+            cache_dir, split="train", task="pretrain", channels=args.channels
+        )
     else:
         pretrain_ds = TemperatureSohDataset(
             args.index, args.mat_dir, split="train", task="pretrain",
-            preload=args.preload,
+            preload=args.preload, channels=args.channels,
         )
     if args.max_samples is not None:
         pretrain_ds = Subset(pretrain_ds, list(range(min(args.max_samples, len(pretrain_ds)))))
@@ -305,7 +309,7 @@ def main() -> None:
         collate_fn=_identity_collate if use_cache else None,
     )
 
-    model = TemperatureSohLSTM().to(device)
+    model = TemperatureSohLSTM(input_dim=args.channels).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"模型参数量: {n_params:,}  预训练样本数: {len(pretrain_ds):,}")
 
@@ -343,11 +347,13 @@ def main() -> None:
     print("阶段 2：SOH 回归微调")
     print("=" * 60)
     if use_cache:
-        soh_ds = MemmapSohDataset(cache_dir, split="train", task="soh")
+        soh_ds = MemmapSohDataset(
+            cache_dir, split="train", task="soh", channels=args.channels
+        )
     else:
         soh_ds = TemperatureSohDataset(
             args.index, args.mat_dir, split="train", task="soh",
-            preload=args.preload,
+            preload=args.preload, channels=args.channels,
         )
     if args.max_samples is not None:
         soh_ds = Subset(soh_ds, list(range(min(args.max_samples, len(soh_ds)))))
@@ -372,10 +378,13 @@ def main() -> None:
     print("测试集评估（test split，未见电池）")
     print("=" * 60)
     if use_cache:
-        test_ds = MemmapSohDataset(cache_dir, split="test", task="soh")
+        test_ds = MemmapSohDataset(
+            cache_dir, split="test", task="soh", channels=args.channels
+        )
     else:
         test_ds = TemperatureSohDataset(
-            args.index, args.mat_dir, split="test", task="soh"
+            args.index, args.mat_dir, split="test", task="soh",
+            channels=args.channels,
         )
     if args.max_samples is not None:
         test_ds = Subset(test_ds, list(range(min(args.max_samples, len(test_ds)))))
