@@ -1,0 +1,275 @@
+"""temperature_soh 训练数据集（方案 A：惰性加载，4 通道）。
+
+本模块把 `segment_index.parquet`（统一片段索引表）包装成 PyTorch Dataset。
+与 partial_soh 的 PartialSohDataset 只有两处区别：
+
+  1. 输入是 **4 通道** `(I, V, Q, T')`，T 是温度曲线；
+  2. 温度采用物理量纲归一化 `T' = (T - 25) / 10`，**不用全体 z-score**
+     （z-score 会被 30°C 恒温主导，失去温度的物理含义）。
+
+核心思想（沿用方案 A 惰性加载）：
+
+    索引表只存“几何 + 标签”，不存曲线。训练时按需：
+      1. 根据 (cell_id, cycle_index) 找到原始 MAT 中的那个循环；
+      2. 提取充电段（I > 0），统一单位（C-rate -> A、分钟 -> 秒）；
+      3. 把该片段 [start_ah, end_ah] 上的 I/V/Q/T 插值到 101 点容量网格，
+         得到模型输入 x ∈ R^(101 x 4)。
+
+通道顺序（与 Trainer 约定）：[I, V, Q, T']。
+
+性能：51 个片段共享同一个循环，重复读 MAT 会很慢，因此用 LRU 缓存
+把“已读过的充电曲线”缓存在内存里（每个循环只读一次，之后复用）。
+"""
+
+from __future__ import annotations
+
+import sys
+from functools import lru_cache
+from pathlib import Path
+
+import h5py
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+
+# 让本文件能 import 到 temperature_soh/DataLoader 里的模块。
+ROOT = Path(__file__).resolve().parents[3]
+DL_DIR = ROOT / "src" / "temperature_soh" / "DataLoader"
+if str(DL_DIR) not in sys.path:
+    sys.path.insert(0, str(DL_DIR))
+
+from mat_io import (  # noqa: E402
+    convert_cycle_to_unified,
+    discover_batch_files,
+    read_raw_cycle_from_file,
+)
+from segments import interpolate_segment  # noqa: E402
+
+
+# 温度归一化常数（物理量纲，非统计量纲）。
+# Severson 电池在 30°C 恒温箱，温度曲线因自热在 26~42°C 之间波动。
+# 以 25°C 为物理零点、10°C 为尺度，T' ≈ 0.1~1.7，量纲含义清晰。
+TEMP_CENTER_C = 25.0
+TEMP_SCALE_C = 10.0
+
+# 通道顺序：与 Trainer/model.py 的 input_dim=4 约定一致。
+CHANNEL_NAMES = ("I", "V", "Q", "T")
+
+
+def _cell_index_from_id(cell_id: str) -> int:
+    """从 cell_id（如 2017-06-30_c000）解析批次内 0-based 下标。"""
+    suffix = cell_id.rsplit("_", 1)[1]
+    if not suffix.startswith("c"):
+        raise ValueError(f"cell_id 格式错误: {cell_id}")
+    return int(suffix[1:])
+
+
+def _batch_from_id(cell_id: str) -> str:
+    """从 cell_id 中提取批次名（如 2017-06-30）。"""
+    return cell_id.rsplit("_", 1)[0]
+
+
+def _normalize_temperature(t: np.ndarray) -> np.ndarray:
+    """物理量纲归一化：T' = (T - 25) / 10。"""
+    return (t - TEMP_CENTER_C) / TEMP_SCALE_C
+
+
+class TemperatureSohDataset(Dataset):
+    """按片段索引惰性生成 (输入, 标签) 的 4 通道 Dataset。"""
+
+    def __init__(
+        self,
+        index_path: Path,
+        mat_dir: Path,
+        split: str = "train",
+        task: str = "soh",
+        cache_size: int | None = 8192,
+        preload: bool = False,
+    ) -> None:
+        """初始化数据集。
+
+        参数
+        ----
+        index_path : temperature_soh 的 segment_index.parquet 路径。
+        mat_dir    : 原始 .mat 文件目录。
+        split      : 只保留哪个划分（train / val / test）。
+        task       : "soh" 返回 SOH 回归样本；
+                     "pretrain" 返回电压预测样本。
+        cache_size : 充电曲线 LRU 缓存大小（按循环数计）。
+        preload    : True 时把本数据集需要的全部充电曲线一次性读进内存。
+        """
+        if task not in ("soh", "pretrain"):
+            raise ValueError(f"task 必须是 'soh' 或 'pretrain'，得到 {task}")
+
+        self.task = task
+        self.mat_dir = Path(mat_dir)
+        self.files = discover_batch_files(self.mat_dir)
+        # 一次性打开所有批次文件并复用句柄，避免每条曲线都重新 open/close。
+        self._handles: dict[str, h5py.File] = {
+            batch: h5py.File(str(path), "r") for batch, path in self.files.items()
+        }
+
+        index = pd.read_parquet(index_path)
+        index = index[index["split"] == split].copy()
+
+        # 两个任务对片段合法性的要求不同：
+        #   SOH 任务只需要观测窗口存在；
+        #   预训练还需要 7% 预测窗口存在。
+        valid_col = "is_valid_soh" if task == "soh" else "is_valid_pretrain"
+        index = index[index[valid_col]].copy()
+
+        # 把列抽成 numpy 数组，避免 __getitem__ 里反复做 pandas 行访问。
+        self.cell_ids = index["cell_id"].to_numpy(dtype=str)
+        self.cycle_indices = index["cycle_index"].to_numpy(dtype=np.int64)
+        self.start_ahs = index["start_ah"].to_numpy(dtype=np.float32)
+        self.end_ahs = index["end_ah"].to_numpy(dtype=np.float32)
+        self.pred_start_ahs = index["pred_start_ah"].to_numpy(dtype=np.float32)
+        self.pred_end_ahs = index["pred_end_ah"].to_numpy(dtype=np.float32)
+        self.soh_values = index["soh"].to_numpy(dtype=np.float32)
+
+        # 同循环一致性需要知道“哪些片段属于同一个循环”。
+        self._group_ids = (
+            index.groupby(["cell_id", "cycle_index"], sort=False)
+            .ngroup()
+            .to_numpy(dtype=np.int64)
+        )
+
+        if preload:
+            cache_size = None
+        self._load_charge = lru_cache(maxsize=cache_size)(self._read_charge_curve)
+
+        if preload:
+            self._preload_charges()
+            self.close()
+
+    def _preload_charges(self) -> None:
+        """把本数据集涉及的所有充电曲线读进缓存（预加载模式）。"""
+        unique = sorted(set(zip(self.cell_ids.tolist(), self.cycle_indices.tolist())))
+        print(f"[dataset] 预加载 {len(unique)} 条充电曲线 ...", flush=True)
+        for pos, (cell_id, cycle_index) in enumerate(unique, start=1):
+            self._load_charge(cell_id, int(cycle_index))
+            if pos % 5000 == 0:
+                print(f"[dataset] 预加载进度 {pos}/{len(unique)}", flush=True)
+
+    def _read_charge_curve(
+        self, cell_id: str, cycle_index: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """读取一个循环的充电曲线（统一单位），返回 (t, V, I, T, Qc)。"""
+        batch = _batch_from_id(cell_id)
+        cell_index = _cell_index_from_id(cell_id)
+        if batch not in self.files:
+            raise FileNotFoundError(f"找不到批次文件: {batch}")
+
+        raw = read_raw_cycle_from_file(
+            self._handles[batch], cell_index, int(cycle_index)
+        )
+        # 统一单位：I C-rate -> A（×1.1），t 分钟 -> 秒（×60）。
+        cycle = convert_cycle_to_unified(raw, cycle_number=int(cycle_index))
+
+        # 提取充电段（I > 0）。temperature_soh 的 segments 统一结构版，
+        # 返回 dict 含 t/V/I/Qc/T。
+        charge = {
+            "t": np.asarray(cycle["time_in_s"], dtype=float),
+            "V": np.asarray(cycle["voltage_in_V"], dtype=float),
+            "I": np.asarray(cycle["current_in_A"], dtype=float),
+            "Qc": np.asarray(cycle["charge_capacity_in_Ah"], dtype=float),
+            "T": np.asarray(cycle["temperature_in_C"], dtype=float),
+        }
+        mask = charge["I"] > 0.0
+        for key in charge:
+            charge[key] = charge[key][mask]
+
+        if charge["V"].size < 2:
+            raise ValueError(
+                f"{cell_id} cycle {cycle_index} 充电段点数不足"
+            )
+
+        return (
+            np.asarray(charge["t"], dtype=np.float32),
+            np.asarray(charge["V"], dtype=np.float32),
+            np.asarray(charge["I"], dtype=np.float32),
+            np.asarray(charge["T"], dtype=np.float32),
+            np.asarray(charge["Qc"], dtype=np.float32),
+        )
+
+    def close(self) -> None:
+        """关闭所有已打开的 MAT 文件句柄（幂等）。"""
+        for handle in self._handles.values():
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+    def _interpolate_window(
+        self,
+        charge: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+        start_ah: float,
+        end_ah: float,
+    ) -> np.ndarray:
+        """把充电曲线插值到 [start_ah, end_ah]，返回 (n_points, 4) 输入。"""
+        t, v, i, temp, qc = charge
+        seg = interpolate_segment(
+            {"t": t, "V": v, "I": i, "T": temp, "Qc": qc},
+            start_ah=float(start_ah),
+            end_ah=float(end_ah),
+        )
+        # 通道顺序：[I, V, Q, T']。T 归一化到 (T-25)/10。
+        x = np.stack(
+            [
+                seg["I"],
+                seg["V"],
+                seg["capacity"],
+                _normalize_temperature(seg["T"]),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        return x
+
+    def _interpolate_pred_window(
+        self,
+        charge: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+        pred_start_ah: float,
+        pred_end_ah: float,
+    ) -> np.ndarray:
+        """把未来 7% 预测窗口插值到等距容量网格，返回 (36, 4)。"""
+        return self._interpolate_window(charge, pred_start_ah, pred_end_ah)
+
+    def __len__(self) -> int:
+        return len(self.cell_ids)
+
+    def group_ids(self) -> np.ndarray:
+        """返回每个样本所属循环的编号（int64 数组）。"""
+        return self._group_ids
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """返回 (x, y)。
+
+        x : (101, 4) 的 float32 张量 [I, V, Q, T']；
+        y : 取决于 task——
+              soh      -> 标量 SOH，形状 ()；
+              pretrain -> (下一步电压 V[1:101] (100,), 未来窗 x_future (36, 4))。
+        """
+        cell_id = self.cell_ids[idx]
+        cycle_index = int(self.cycle_indices[idx])
+        charge = self._load_charge(cell_id, cycle_index)
+
+        x = self._interpolate_window(
+            charge, self.start_ahs[idx], self.end_ahs[idx]
+        )
+
+        if self.task == "soh":
+            y = np.asarray(self.soh_values[idx], dtype=np.float32)
+        else:
+            # 预训练目标：观测窗内电压序列后移一位作为“下一步电压”。
+            y = x[1:, 1]
+            x_future = self._interpolate_pred_window(
+                charge, self.pred_start_ahs[idx], self.pred_end_ahs[idx]
+            )
+            return (
+                torch.from_numpy(x),
+                torch.from_numpy(y),
+                torch.from_numpy(x_future),
+            )
+
+        return torch.from_numpy(x), torch.from_numpy(y)
