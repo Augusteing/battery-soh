@@ -180,13 +180,13 @@ def pretrain_voltage(
 
             recon_loss_val = 0.0
             future_loss_val = 0.0
-            pred = model.voltage_predict(x)  # (B, 101)
+            # 一次编码同时得到观测窗下一步电压与未来窗电压。
+            pred, future_pred = model.voltage_and_future(x)
             # 损失 1：观测窗内“下一步电压”的密集监督。
             # 除以 accum_steps：累积 N 步后再更新，等效于大 batch。
             loss = loss_fn(pred[:, :-1], y) / accum_steps
             # 损失 2：未来 7% 容量窗的电压预测（论文对齐）。
             # 直接从最终状态预测整条未来曲线，监督 = 未来窗真实电压。
-            future_pred = model.future_predict(x)  # (B, 36)
             future_loss_val = loss_fn(future_pred, x_future[:, :, 1])
             loss = loss + future_loss_val / accum_steps
             if recon_lambda > 0:

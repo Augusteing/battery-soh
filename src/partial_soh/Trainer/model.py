@@ -132,6 +132,21 @@ class PartialSohLSTM(nn.Module):
         state = torch.cat([h_n[-1], c_n[-1]], dim=-1)  # (B, 128)
         return self.future_head(state)  # (B, 36)
 
+    def voltage_and_future(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """一次编码同时输出“下一步电压”和“未来窗电压”。
+
+        预训练循环里如果分别调用 voltage_predict 和 future_predict，
+        每个都会完整跑一遍 LSTM 编码。合并后只编码一次，
+        预训练计算量减少约 1/3。
+        """
+        lstm_out, h_n, c_n = self.encode(x)
+        voltage_pred = self.voltage_head(lstm_out).squeeze(-1)  # (B, T)
+        state = torch.cat([h_n[-1], c_n[-1]], dim=-1)  # (B, 128)
+        future_pred = self.future_head(state)  # (B, 36)
+        return voltage_pred, future_pred
+
     def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
         """重建每个时间步的电压，返回 (B, T)。
 

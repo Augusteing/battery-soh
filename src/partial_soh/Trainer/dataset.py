@@ -58,6 +58,27 @@ _SHARED_CHARGE_CACHE: OrderedDict[
     tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
 ] = OrderedDict()
 
+# 进程内共享的“片段矩阵”缓存：soh 任务和 pretrain 任务需要同一份
+# X_train（约 4.9GB）。如果各自 np.fromfile 一份，双份拷贝实测会导致
+# 内存换页、训练卡死（WorkingSet 涨到 22GB）。这里按 (split, kind)
+# 只加载一次，所有 Dataset 实例共用。
+_ARRAY_CACHE: dict[tuple[str, str], np.ndarray] = {}
+
+
+def _load_shared_array(
+    cache_dir: Path, split: str, kind: str, shape: tuple[int, ...]
+) -> np.ndarray:
+    """按 (split, kind) 加载一次并缓存；kind: "x"（观测窗）或 "future"（未来窗）。"""
+    key = (split, kind)
+    arr = _ARRAY_CACHE.get(key)
+    if arr is None:
+        name = "X" if kind == "x" else "X_future"
+        arr = np.fromfile(
+            cache_dir / f"{name}_{split}.npy", dtype=np.float32
+        ).reshape(shape)
+        _ARRAY_CACHE[key] = arr
+    return arr
+
 
 def _shared_cache_get(
     key: tuple[str, int, int],
@@ -330,15 +351,12 @@ class MemmapSohDataset(Dataset):
         meta = json.loads((cache_dir / "meta.json").read_text(encoding="utf-8"))
         shape = tuple(int(v) for v in meta[f"shape_{split}"])  # (N, 101, 3)
         if in_memory:
-            # 一次性把整个片段矩阵读进 RAM（约 5 GB）。
+            # 一次性把整个片段矩阵读进 RAM（约 5 GB），多个 Dataset 共享
+            # 同一份数组，避免 soh/pretrain 各复制一份导致内存翻倍。
             # 训练时每个 step 都要随机取 4096 行；如果留在 memmap，
             # 随机读取可能触发页面换入，CPU 仍会成为瓶颈。
             # 载入内存后，随机访问稳定在内存速度。
-            # 注意：build_cache.py 用 np.memmap(mode="w+") 写的是裸二进制
-            # （没有 .npy 文件头），所以这里用 fromfile 读原始字节。
-            self._x = np.fromfile(
-                cache_dir / f"X_{split}.npy", dtype=np.float32
-            ).reshape(shape)
+            self._x = _load_shared_array(cache_dir, split, "x", shape)
         else:
             self._x = np.memmap(
                 str(cache_dir / f"X_{split}.npy"),
@@ -355,9 +373,9 @@ class MemmapSohDataset(Dataset):
             # 避免 SOH 任务多占内存。
             future_shape = tuple(int(v) for v in meta[f"shape_future_{split}"])
             if in_memory:
-                self._x_future = np.fromfile(
-                    cache_dir / f"X_future_{split}.npy", dtype=np.float32
-                ).reshape(future_shape)
+                self._x_future = _load_shared_array(
+                    cache_dir, split, "future", future_shape
+                )
             else:
                 self._x_future = np.memmap(
                     str(cache_dir / f"X_future_{split}.npy"),
