@@ -28,7 +28,10 @@ and the nominal capacity"。对应 MATR 的 Qc（逐点累计充电容量，
 输出列：
 
   cell_id, cycle_index, charge_capacity_ah, soh, temperature_c,
-  is_bad_cycle, is_valid_label
+  policy, is_bad_cycle, is_valid_label
+
+policy 列来自 Severson .mat 的 batch 级字段（原始编码，如 "1C_4PER_6C"），
+供 splits.py 做“按协议留出”的工况泛化划分。
 
 运行：
 
@@ -102,6 +105,13 @@ def _deref_array(f: h5py.File, value: Any) -> np.ndarray:
     return np.asarray(f[ref][()]).ravel()
 
 
+def _decode_ascii(f: h5py.File, value: Any) -> str:
+    """把 MATLAB 存成 uint16/uint8 的 ASCII 字符串数组解码为 str。"""
+    arr = np.asarray(f[value][()]).ravel()
+    text = bytes(int(x) for x in arr).decode("ascii", errors="replace")
+    return text.replace("\x00", "").strip()
+
+
 # ---------------------------------------------------------------------------
 # Severson 标签构建
 # ---------------------------------------------------------------------------
@@ -119,11 +129,14 @@ def _build_matr_labels(mat_dir: Path | None = None) -> pd.DataFrame:
         n_cells = count_cells_in_mat(mat_path)
         with h5py.File(str(mat_path), "r") as f:
             batch = f["batch"]
+            # batch 级 policy 字段：shape (n_cells, 1) 的对象引用数组。
+            policy_refs = np.asarray(batch["policy"])
             for cell_index in range(n_cells):
                 cell_ref = batch["cycles"][cell_index, 0]
                 cell = f[cell_ref]
                 n_cycles = int(np.asarray(cell["V"]).shape[0])
                 cell_id = cell_id_for(batch_name, cell_index)
+                policy = _decode_ascii(f, policy_refs[cell_index, 0])
 
                 for cycle_index in range(1, n_cycles + 1):
                     qc = _deref_array(f, cell["Qc"][cycle_index - 1])
@@ -133,6 +146,7 @@ def _build_matr_labels(mat_dir: Path | None = None) -> pd.DataFrame:
                             "cycle_index": cycle_index,
                             "charge_capacity_ah": final_capacity(qc),
                             "temperature_c": 30.0,  # MATR 为 30°C 恒温箱
+                            "policy": policy,
                         }
                     )
         print(f"[labels] MATR 批次 {batch_name}: {n_cells} channel 已读取")
