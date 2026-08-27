@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -55,6 +56,30 @@ TEMP_SCALE_C = 10.0
 
 # 通道顺序：与 Trainer/model.py 的 input_dim=4 约定一致。
 CHANNEL_NAMES = ("I", "V", "Q", "T")
+
+
+# ---------------------------------------------------------------------------
+# 进程内共享数组缓存（memmap 模式用）
+# ---------------------------------------------------------------------------
+# soh 任务和 pretrain 任务需要同一份 X_train（约 5 GB）。
+# 如果各自 np.fromfile 一份，双份拷贝实测会导致内存换页、训练卡死。
+# 这里按 (split, kind) 只加载一次，所有 Dataset 实例共用。
+_ARRAY_CACHE: dict[tuple[str, str], np.ndarray] = {}
+
+
+def _load_shared_array(
+    cache_dir: Path, split: str, kind: str, shape: tuple[int, ...]
+) -> np.ndarray:
+    """按 (split, kind) 加载一次并缓存；kind: "x" 或 "future"。"""
+    key = (split, kind)
+    arr = _ARRAY_CACHE.get(key)
+    if arr is None:
+        name = "X" if kind == "x" else "X_future"
+        arr = np.fromfile(
+            cache_dir / f"{name}_{split}.npy", dtype=np.float32
+        ).reshape(shape)
+        _ARRAY_CACHE[key] = arr
+    return arr
 
 
 def _cell_index_from_id(cell_id: str) -> int:
@@ -273,3 +298,108 @@ class TemperatureSohDataset(Dataset):
             )
 
         return torch.from_numpy(x), torch.from_numpy(y)
+
+
+class MemmapSohDataset(Dataset):
+    """从磁盘 memmap 缓存直接读取 4 通道片段（训练提速用）。
+
+    背景
+    ----
+    片段是静态数据：同一个片段每次插值结果完全一样。`build_cache.py`
+    一次性把全部片段插值好写入磁盘，本类只做“按行切片 + 转张量”。
+    训练时 CPU 几乎不干活，瓶颈回到 GPU。
+
+    与 TemperatureSohDataset 的区别：
+      - 不做 MAT 读取、不做插值（都已在构建缓存时完成）；
+      - 两个任务（soh / pretrain）共享同一份输入，只在 __getitem__
+        里按任务返回不同标签。
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        split: str,
+        task: str = "soh",
+        in_memory: bool = True,
+    ) -> None:
+        if task not in ("soh", "pretrain"):
+            raise ValueError(f"task 必须是 'soh' 或 'pretrain'，得到 {task}")
+        self.task = task
+        cache_dir = Path(cache_dir)
+
+        meta = json.loads((cache_dir / "meta.json").read_text(encoding="utf-8"))
+        shape = tuple(int(v) for v in meta[f"shape_{split}"])  # (N, 101, 4)
+        if in_memory:
+            # 一次性把整个片段矩阵读进 RAM（约 5 GB），多个 Dataset 共享
+            # 同一份数组，避免 soh/pretrain 各复制一份导致内存翻倍。
+            self._x = _load_shared_array(cache_dir, split, "x", shape)
+        else:
+            self._x = np.memmap(
+                str(cache_dir / f"X_{split}.npy"),
+                dtype=np.float32,
+                mode="r",
+                shape=shape,
+            )
+        self._y = np.load(cache_dir / f"y_{split}.npy")
+        self._pretrain_mask = np.load(cache_dir / f"is_valid_pretrain_{split}.npy")
+        self._group_ids = np.load(cache_dir / f"group_ids_{split}.npy")
+        self._x_future: np.ndarray | None = None
+        if task == "pretrain":
+            # 未来 7% 预测窗（36 点），只在预训练任务需要时载入。
+            future_shape = tuple(int(v) for v in meta[f"shape_future_{split}"])
+            if in_memory:
+                self._x_future = _load_shared_array(
+                    cache_dir, split, "future", future_shape
+                )
+            else:
+                self._x_future = np.memmap(
+                    str(cache_dir / f"X_future_{split}.npy"),
+                    dtype=np.float32,
+                    mode="r",
+                    shape=future_shape,
+                )
+
+        if task == "pretrain":
+            # 预训练任务只需要“拥有完整 7% 预测窗口”的片段。
+            self._valid = np.flatnonzero(self._pretrain_mask)
+        else:
+            # SOH 任务：缓存里全是 is_valid_soh 的片段，全部可用。
+            self._valid = np.arange(len(self._y))
+
+    def __len__(self) -> int:
+        return len(self._valid)
+
+    def group_ids(self) -> np.ndarray:
+        """返回每个样本所属循环的编号（int64）。"""
+        return self._group_ids
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """返回 (x, y)，形状与 TemperatureSohDataset 完全一致。"""
+        row = int(self._valid[idx])
+        x = torch.from_numpy(np.array(self._x[row]))  # (101, 4)
+        if self.task == "soh":
+            y = torch.from_numpy(np.asarray(self._y[row]))  # 标量 SOH
+        else:
+            y = x[1:, 1]  # 下一步电压 V[1:101]
+            x_future = torch.from_numpy(np.array(self._x_future[row]))  # (36, 4)
+            return x, y, x_future
+        return x, y
+
+    def __getitems__(self, indices: list[int]) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """批量读取（PyTorch 2.1+ 的 DataLoader 会优先调用本方法）。
+
+        用 numpy 的 fancy indexing 一次性取出整个 batch，
+        把 4096 次 Python 层调用降成 1 次。
+        配合 trainer 里的 identity collate 使用。
+        """
+        rows = self._valid[np.asarray(indices)]
+        x = torch.from_numpy(np.array(self._x[rows]))  # (B, 101, 4)
+        if self.task == "soh":
+            y = torch.from_numpy(np.array(self._y[rows]))  # (B,)
+            return x, y
+        else:
+            y = x[:, 1:, 1]  # (B, 100)
+            x_future = torch.from_numpy(
+                np.array(self._x_future[rows])
+            )  # (B, 36, 4)
+            return x, y, x_future

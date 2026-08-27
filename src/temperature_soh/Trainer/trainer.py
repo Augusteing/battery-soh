@@ -40,12 +40,13 @@ TR_DIR = Path(__file__).resolve().parent
 if str(TR_DIR) not in sys.path:
     sys.path.insert(0, str(TR_DIR))
 
-from dataset import TemperatureSohDataset  # noqa: E402
+from dataset import MemmapSohDataset, TemperatureSohDataset  # noqa: E402
 from model import TemperatureSohLSTM  # noqa: E402
 
 DEFAULT_INDEX = ROOT / "data" / "processed" / "temperature_soh" / "segment_index.parquet"
 DEFAULT_MAT_DIR = ROOT / "data" / "external" / "matr"
 DEFAULT_OUT = ROOT / "models" / "temperature_soh" / "temperature_soh.pt"
+DEFAULT_CACHE_DIR = ROOT / "data" / "processed" / "temperature_soh" / "cache"
 
 
 @dataclass
@@ -69,6 +70,12 @@ def _set_seed(seed: int) -> None:
     """固定随机种子，保证可复现。"""
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+
+def _identity_collate(batch):
+    """identity collate：MemmapSohDataset.__getitems__ 已经堆叠成张量，
+    DataLoader 直接把这个结果当作一个 batch，不再逐样本组装。"""
+    return batch
 
 
 def _save_model(path: Path, model: nn.Module) -> None:
@@ -205,9 +212,16 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=TrainingConfig.seed)
     parser.add_argument("--max-samples", type=int, default=None,
                         help="每个 split 只取前 N 个片段（冒烟测试用）")
+    parser.add_argument("--cache-dir", type=Path, default=None,
+                        help="memmap 缓存目录（存在时用 MemmapSohDataset 提速）")
     parser.add_argument("--preload", action="store_true",
                         help="预加载充电曲线到内存（全量训练建议开启）")
     args = parser.parse_args()
+
+    cache_dir = Path(args.cache_dir) if args.cache_dir is not None else DEFAULT_CACHE_DIR
+    use_cache = (cache_dir / "meta.json").exists()
+    if use_cache:
+        print(f"使用 memmap 缓存: {cache_dir}")
 
     cfg = TrainingConfig(
         batch_size=args.batch_size,
@@ -224,15 +238,19 @@ def main() -> None:
     print("=" * 60)
     print("阶段 1：电压预测预训练（4 通道）")
     print("=" * 60)
-    pretrain_ds = TemperatureSohDataset(
-        args.index, args.mat_dir, split="train", task="pretrain",
-        preload=args.preload,
-    )
+    if use_cache:
+        pretrain_ds = MemmapSohDataset(cache_dir, split="train", task="pretrain")
+    else:
+        pretrain_ds = TemperatureSohDataset(
+            args.index, args.mat_dir, split="train", task="pretrain",
+            preload=args.preload,
+        )
     if args.max_samples is not None:
         pretrain_ds = Subset(pretrain_ds, list(range(min(args.max_samples, len(pretrain_ds)))))
     pretrain_loader = DataLoader(
         pretrain_ds, batch_size=cfg.batch_size, shuffle=True,
         num_workers=cfg.num_workers, drop_last=False,
+        collate_fn=_identity_collate if use_cache else None,
     )
 
     model = TemperatureSohLSTM().to(device)
@@ -246,15 +264,19 @@ def main() -> None:
     print("=" * 60)
     print("阶段 2：SOH 回归微调")
     print("=" * 60)
-    soh_ds = TemperatureSohDataset(
-        args.index, args.mat_dir, split="train", task="soh",
-        preload=args.preload,
-    )
+    if use_cache:
+        soh_ds = MemmapSohDataset(cache_dir, split="train", task="soh")
+    else:
+        soh_ds = TemperatureSohDataset(
+            args.index, args.mat_dir, split="train", task="soh",
+            preload=args.preload,
+        )
     if args.max_samples is not None:
         soh_ds = Subset(soh_ds, list(range(min(args.max_samples, len(soh_ds)))))
     soh_loader = DataLoader(
         soh_ds, batch_size=cfg.batch_size, shuffle=True,
         num_workers=cfg.num_workers, drop_last=False,
+        collate_fn=_identity_collate if use_cache else None,
     )
     finetune_soh(
         model, soh_loader, cfg.finetune_epochs, cfg.lr, cfg.grad_clip, device
@@ -264,12 +286,18 @@ def main() -> None:
     print("=" * 60)
     print("测试集评估（test split，未见电池）")
     print("=" * 60)
-    test_ds = TemperatureSohDataset(args.index, args.mat_dir, split="test", task="soh")
+    if use_cache:
+        test_ds = MemmapSohDataset(cache_dir, split="test", task="soh")
+    else:
+        test_ds = TemperatureSohDataset(
+            args.index, args.mat_dir, split="test", task="soh"
+        )
     if args.max_samples is not None:
         test_ds = Subset(test_ds, list(range(min(args.max_samples, len(test_ds)))))
     test_loader = DataLoader(
         test_ds, batch_size=cfg.batch_size, shuffle=False,
         num_workers=cfg.num_workers, drop_last=False,
+        collate_fn=_identity_collate if use_cache else None,
     )
     test_mae = evaluate_mae(model, test_loader, device)
     print(f"test MAE = {test_mae:.4f}  (样本数 {len(test_ds):,})")
