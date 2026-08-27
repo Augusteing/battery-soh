@@ -84,6 +84,42 @@ def _save_model(path: Path, model: nn.Module) -> None:
     torch.save({"model": model.state_dict()}, path)
 
 
+def _ckpt_path(model_out: Path) -> Path:
+    """checkpoint 文件与模型同目录、同名，后缀改为 .ckpt。"""
+    return model_out.with_name(model_out.stem + ".ckpt")
+
+
+def _save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    stage: str,
+    epoch: int,
+) -> None:
+    """保存可续训的 checkpoint：模型权重 + 优化器状态 + 阶段/epoch 信息。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "stage": stage,   # "pretrain" 或 "finetune"
+            "epoch": epoch,   # 刚完成的 epoch 编号
+        },
+        path,
+    )
+
+
+def _load_checkpoint(
+    path: Path, model: nn.Module, lr: float
+) -> tuple[dict, torch.optim.Optimizer]:
+    """从 checkpoint 恢复模型权重和优化器状态。"""
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    model.load_state_dict(ckpt["model"])
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer.load_state_dict(ckpt["optimizer"])
+    return ckpt, optimizer
+
+
 def pretrain_voltage(
     model: TemperatureSohLSTM,
     loader: DataLoader,
@@ -91,6 +127,9 @@ def pretrain_voltage(
     lr: float,
     grad_clip: float,
     device: torch.device,
+    ckpt_path: Path | None = None,
+    start_epoch: int = 1,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> float:
     """在电压预测任务上预训练，返回最后一个 epoch 的平均损失。
 
@@ -99,12 +138,13 @@ def pretrain_voltage(
       2. 未来 7% 容量窗电压：从最终状态直接预测 36 点曲线，
          监督 = 未来窗的真实电压（x_future 的 V 通道）。
     """
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    if optimizer is None:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
     model.train()
 
     final_loss = float("nan")
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         total, n = 0.0, 0
         total_future = 0.0
         t0 = time.perf_counter()
@@ -134,6 +174,9 @@ def pretrain_voltage(
             f"loss={final_loss:.6f}  future={total_future / n:.6f}  "
             f"({time.perf_counter() - t0:.1f}s)"
         )
+        if ckpt_path is not None:
+            _save_checkpoint(ckpt_path, model, optimizer, "pretrain", epoch)
+            print(f"  [checkpoint] saved -> {ckpt_path}")
     return final_loss
 
 
@@ -144,14 +187,18 @@ def finetune_soh(
     lr: float,
     grad_clip: float,
     device: torch.device,
+    ckpt_path: Path | None = None,
+    start_epoch: int = 1,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> float:
     """在 SOH 回归任务上微调，返回最后一个 epoch 的平均损失。"""
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    if optimizer is None:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
     model.train()
 
     final_loss = float("nan")
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         total, n = 0.0, 0
         t0 = time.perf_counter()
         for step, (x, y) in enumerate(loader, start=1):
@@ -174,6 +221,9 @@ def finetune_soh(
             f"  [finetune] epoch {epoch:3d}/{epochs}  "
             f"loss={final_loss:.6f}  ({time.perf_counter() - t0:.1f}s)"
         )
+        if ckpt_path is not None:
+            _save_checkpoint(ckpt_path, model, optimizer, "finetune", epoch)
+            print(f"  [checkpoint] saved -> {ckpt_path}")
     return final_loss
 
 
@@ -216,6 +266,8 @@ def main() -> None:
                         help="memmap 缓存目录（存在时用 MemmapSohDataset 提速）")
     parser.add_argument("--preload", action="store_true",
                         help="预加载充电曲线到内存（全量训练建议开启）")
+    parser.add_argument("--resume", action="store_true",
+                        help="从 --out 同名 .ckpt 断点续训")
     args = parser.parse_args()
 
     cache_dir = Path(args.cache_dir) if args.cache_dir is not None else DEFAULT_CACHE_DIR
@@ -256,9 +308,35 @@ def main() -> None:
     model = TemperatureSohLSTM().to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"模型参数量: {n_params:,}  预训练样本数: {len(pretrain_ds):,}")
-    pretrain_voltage(
-        model, pretrain_loader, cfg.pretrain_epochs, cfg.lr, cfg.grad_clip, device
+
+    ckpt_path = _ckpt_path(args.out)
+    resume_stage = None
+    resume_epoch = 0
+    pretrain_opt = None
+    finetune_opt = None
+    if args.resume and ckpt_path.exists():
+        ckpt, optimizer = _load_checkpoint(ckpt_path, model, cfg.lr)
+        resume_stage = ckpt["stage"]
+        resume_epoch = int(ckpt["epoch"])
+        print(f"[resume] 从 stage={resume_stage}, epoch={resume_epoch} 继续")
+        if resume_stage == "pretrain":
+            pretrain_opt = optimizer
+        else:
+            finetune_opt = optimizer
+
+    pretrain_done = (
+        (resume_stage == "pretrain" and resume_epoch >= cfg.pretrain_epochs)
+        or resume_stage == "finetune"
     )
+    if not pretrain_done:
+        pretrain_voltage(
+            model, pretrain_loader, cfg.pretrain_epochs, cfg.lr, cfg.grad_clip,
+            device, ckpt_path=ckpt_path,
+            start_epoch=(resume_epoch + 1) if resume_stage == "pretrain" else 1,
+            optimizer=pretrain_opt,
+        )
+    else:
+        print("预训练已完成，跳过（从 checkpoint 恢复）")
 
     # ---- 阶段 2：SOH 回归微调（train split）----
     print("=" * 60)
@@ -278,9 +356,16 @@ def main() -> None:
         num_workers=cfg.num_workers, drop_last=False,
         collate_fn=_identity_collate if use_cache else None,
     )
-    finetune_soh(
-        model, soh_loader, cfg.finetune_epochs, cfg.lr, cfg.grad_clip, device
-    )
+    finetune_done = resume_stage == "finetune" and resume_epoch >= cfg.finetune_epochs
+    if not finetune_done:
+        finetune_soh(
+            model, soh_loader, cfg.finetune_epochs, cfg.lr, cfg.grad_clip,
+            device, ckpt_path=ckpt_path,
+            start_epoch=(resume_epoch + 1) if resume_stage == "finetune" else 1,
+            optimizer=finetune_opt,
+        )
+    else:
+        print("微调已完成，跳过（从 checkpoint 恢复）")
 
     # ---- 评估：test split MAE ----
     print("=" * 60)
