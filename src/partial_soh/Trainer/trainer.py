@@ -209,11 +209,10 @@ def pretrain_voltage(
             total_recon += float(recon_loss_val) * x.size(0)
             total_future += float(future_loss_val) * x.size(0)
 
-        # epoch 末尾：如果剩余累积梯度不足 accum_steps，做最后一次更新。
-        if len(loader) % accum_steps != 0:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-            optimizer.zero_grad()
+        # epoch 末尾：只清空累积梯度，不做“半批次”更新。
+        # 否则最后不足 accum_steps 个 micro-batch 的梯度噪声很大，
+        # 会把模型推离收敛点（50+50 全量训练时观察到测试误差不降反升）。
+        optimizer.zero_grad()
 
         final_loss = total / n
         avg_recon = total_recon / n if recon_lambda > 0 else float("nan")
@@ -287,10 +286,8 @@ def finetune_soh(
             n += x.size(0)
             total_consist += float(consist_val) * x.size(0)
 
-        if len(loader) % accum_steps != 0:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-            optimizer.zero_grad()
+        # epoch 末尾：同样只清梯度，避免半批次噪声更新。
+        optimizer.zero_grad()
 
         final_loss = total / n
         avg_consist = total_consist / n if consist_lambda > 0 else float("nan")
