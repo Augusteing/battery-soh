@@ -28,20 +28,23 @@
 - **附加实验**：温度外推（如训练 15/25°C，测试 35°C），
   只作为论文卖点展示，不作为主协议。
 
-## 3. SOH 标签口径（统一决策）
+## 3. SOH 标签口径（对齐原论文，只加温度通道）
 
-统一采用**“以 cycle 2 放电容量为参考”**的归一化口径：
+统一采用 Scientific Reports 2026 原论文口径：
 
 ```
-SOH(k) = Q_discharge(k) / Q_discharge(cycle 2)
+SOH(k) = Q_charge(k) / Q_nominal（1.1 Ah）
 ```
 
-原因：
+即“当前循环可充电容量 / 标称容量”，对应 MATR 的 Qc、
+SNL/HUST pkl 的 `charge_capacity_in_Ah`（逐点累计充电容量取末值）。
 
-- 与 Scientific Reports 2026 论文一致；
-- HUST 的出厂容量（约 1.19 Ah）明显高于标称 1.1 Ah，
-  若用标称容量做分母，起始 SOH 会超过 100%，失真；
-- 每个数据集独立计算自己的 cycle 2 参考容量。
+明确不使用放电口径：`Qd / Qd(cycle 2)` 是 World Model 论文的口径，
+本模块与其无关。
+
+注意（HUST 的固有属性）：HUST 出厂容量约 1.19 Ah > 标称 1.1 Ah，
+因此其起始 SOH 约 1.08。这是原论文口径的必然结果，模型可自行学习
+该偏移；跨数据集对比 SOH 时需注意此常数差。
 
 ## 4. 模型架构（规划）
 
