@@ -52,6 +52,7 @@ from segments import (  # noqa: E402
     START_STEP_PCT,
     STEPS_PER_PCT,
     build_segment_index_for_cycle,
+    extract_charge_curve,
     interpolate_segment,
 )
 from sit_io import (  # noqa: E402
@@ -80,11 +81,16 @@ def build_normalized_inputs(
     cycle: dict,
     index: "object",
     nominal_capacity: float,
+    channels: int = 3,
 ) -> tuple[np.ndarray, np.ndarray]:
     """把合法片段插值并归一化，返回 (x 矩阵, 对应标签行号)。"""
     x_list: list[np.ndarray] = []
     valid_rows: list[int] = []
-    charge = cycle  # sit_io 已返回充电段统一结构
+    # sit_io 返回统一循环结构（键 charge_capacity_in_Ah 等），
+    # 先转成 interpolate_segment 需要的充电段 dict（键 Qc）。
+    charge = extract_charge_curve(cycle)
+    if channels not in (3, 4):
+        raise ValueError(f"channels 必须是 3 或 4，得到 {channels}")
     for i, row in enumerate(index.itertuples(index=False)):
         if not row.is_valid_soh:
             continue
@@ -104,6 +110,8 @@ def build_normalized_inputs(
             ],
             axis=1,
         ).astype(np.float32)
+        if channels < x.shape[1]:
+            x = x[:, :channels]  # 3 通道模型：去掉温度通道
         x_list.append(x)
         valid_rows.append(i)
     if not x_list:
@@ -122,6 +130,7 @@ def evaluate_cell(
     device: torch.device,
     data_dir: Path,
     max_cycles: int | None = None,
+    channels: int = 3,
 ) -> dict:
     """评估一只 SIT 电池，返回误差统计与样本数。"""
     summary = load_cycle_summary(cell_id, data_dir)
@@ -144,7 +153,9 @@ def evaluate_cell(
             observed_capacity_pct=OBSERVED_CAPACITY_PCT,
             prediction_capacity_pct=0.07,
         )
-        x, valid_rows = build_normalized_inputs(cycle, index, SIT_NOMINAL_CAPACITY_AH)
+        x, valid_rows = build_normalized_inputs(
+            cycle, index, SIT_NOMINAL_CAPACITY_AH, channels=channels
+        )
         if len(valid_rows) == 0:
             continue
 
@@ -211,7 +222,8 @@ def main() -> None:
     for pos, (_, cell_row) in enumerate(cells.iterrows(), start=1):
         cell_id = str(cell_row["cell_id"])
         result = evaluate_cell(
-            model, cell_id, device, args.data_dir, max_cycles=args.max_cycles
+            model, cell_id, device, args.data_dir,
+            max_cycles=args.max_cycles, channels=3,
         )
         rows.append(
             {

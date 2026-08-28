@@ -208,7 +208,12 @@ def read_charge_cycle(
     for col in temp_cols[1:]:
         if temp_series.isna().all():
             temp_series = df[col]
-    temperature = temp_series.to_numpy(dtype=float)
+    # 个别 xlsx 的温度列可能混入非数值（如重复表头字符串），
+    # 统一转数值，坏值置 NaN 后按中位数兜底，避免污染插值。
+    temperature = pd.to_numeric(temp_series, errors="coerce").to_numpy(dtype=float)
+    if np.isnan(temperature).any():
+        median_t = float(np.nanmedian(temperature))
+        temperature = np.where(np.isnan(temperature), median_t, temperature)
 
     return {
         "cycle_number": int(cycle_number),
