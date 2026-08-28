@@ -328,6 +328,9 @@ def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pretrained", type=Path, default=DEFAULT_PRETRAINED)
+    parser.add_argument("--init", choices=("pretrained", "random"), default="pretrained",
+                        help="pretrained=从 Severson 预训练权重出发（迁移）；"
+                             "random=随机初始化（SIT-only 从头训练对照）")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_SIT_DIR)
     parser.add_argument("--cache-dir", type=Path, default=None,
                         help="SIT 片段缓存目录（先跑 sit_cache.py；存在则秒级读取）")
@@ -339,6 +342,8 @@ def main() -> None:
     )
     parser.add_argument("--max-test-cells", type=int, default=None,
                         help="只评估前 N 只测试电池（冒烟测试用）")
+    parser.add_argument("--test-cells", default=None,
+                        help="显式指定评估电池（逗号分隔，优先于自动选择）")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--freeze-encoder", action="store_true",
@@ -350,19 +355,28 @@ def main() -> None:
     if args.freeze_encoder and args.unfreeze_encoder:
         raise ValueError("--freeze-encoder 与 --unfreeze-encoder 互斥")
     freeze = args.freeze_encoder or not args.unfreeze_encoder  # 默认冻结
+    if args.init == "random" and freeze:
+        print("提示: 随机初始化不能冻结编码器，自动切换为全量训练")
+        freeze = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not args.pretrained.exists():
-        raise FileNotFoundError(f"找不到预训练模型: {args.pretrained}")
     model = TemperatureSohLSTM(input_dim=3, use_temp_embed=False)
-    ckpt = torch.load(args.pretrained, map_location="cpu", weights_only=True)
-    model.load_state_dict(ckpt["model"])
+    if args.init == "pretrained":
+        if not args.pretrained.exists():
+            raise FileNotFoundError(f"找不到预训练模型: {args.pretrained}")
+        ckpt = torch.load(args.pretrained, map_location="cpu", weights_only=True)
+        model.load_state_dict(ckpt["model"])
+        print(f"初始化: 预训练权重 {args.pretrained}")
+    else:
+        print("初始化: 随机权重（SIT-only 从头训练对照）")
     model.to(device)
-    print(f"预训练模型: {args.pretrained}  设备: {device}")
+    print(f"设备: {device}")
 
     train_cells = [c.strip() for c in args.train_cells.split(",") if c.strip()]
     all_cells = discover_sit_cells(args.data_dir)["cell_id"].tolist()
     test_cells = [c for c in all_cells if c not in train_cells]
+    if args.test_cells is not None:
+        test_cells = [c.strip() for c in args.test_cells.split(",") if c.strip()]
     if args.max_test_cells is not None:
         test_cells = test_cells[: args.max_test_cells]
     print(f"微调电池: {train_cells}  测试电池数: {len(test_cells)}")
@@ -381,7 +395,10 @@ def main() -> None:
     x_train = torch.from_numpy(np.concatenate(xs))
     y_train = torch.from_numpy(np.concatenate(ys))
 
-    finetune(model, x_train, y_train, args.epochs, args.lr, freeze, device)
+    if args.epochs > 0:
+        finetune(model, x_train, y_train, args.epochs, args.lr, freeze, device)
+    else:
+        print("epochs=0：跳过微调，直接评估预训练模型（零样本对照）")
 
     rows = evaluate(model, test_cells, args.data_dir, device, args.cache_dir)
     _print_report(rows)
