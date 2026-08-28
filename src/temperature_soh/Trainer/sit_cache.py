@@ -1,0 +1,127 @@
+"""SIT 片段缓存构建：把 xlsx 片段一次性物化为 memmap，加速 few-shot 迭代。
+
+背景
+----
+SIT 数据是逐个 xlsx 存储的（20 只电池 × 约 700 循环 × 2 sheet），
+每次评估/微调都要重新读 xlsx + 插值，单只电池约 3~4 分钟，
+17 只电池评估要 1 小时。片段是静态数据，可以一次性缓存。
+
+产物（data/processed/sit_cache/）：
+  X.npy            float32 (N, 101, 3)  归一化输入 [I(C-rate), V, Q(SOC)]
+  y.npy            float32 (N,)         SOH = Qc / Qc_max
+  cell_ids.npy     str (N,)             每行所属电池
+  meta.json        每电池样本数、总样本数
+
+用法：
+```powershell
+# 构建全部 20 只（约 70 分钟）
+& "E:\conda\envs\battery-soh\python.exe" src/temperature_soh/Trainer/sit_cache.py
+
+# 只构建指定电池（快速实验，约 3~4 分钟/只）
+& "E:\conda\envs\battery-soh\python.exe" src/temperature_soh/Trainer/sit_cache.py --cells 001-1,001-2,002-1
+```
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[3]
+TR_DIR = Path(__file__).resolve().parent
+DL_DIR = ROOT / "src" / "temperature_soh" / "DataLoader"
+for d in (TR_DIR, DL_DIR):
+    if str(d) not in sys.path:
+        sys.path.insert(0, str(d))
+
+from finetune_sit import build_cell_samples  # noqa: E402
+from sit_io import DEFAULT_SIT_DIR, discover_sit_cells  # noqa: E402
+
+DEFAULT_CACHE_DIR = ROOT / "data" / "processed" / "sit_cache"
+
+
+def build_cache(
+    cell_ids: list[str],
+    data_dir: Path,
+    cache_dir: Path,
+) -> None:
+    """为指定电池构建片段缓存（追加模式：已存在的电池跳过）。"""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # 已有缓存信息
+    meta_path = cache_dir / "meta.json"
+    existing: dict = {}
+    if meta_path.exists():
+        existing = json.loads(meta_path.read_text(encoding="utf-8"))
+    done = set(existing.get("cells", []))
+    todo = [c for c in cell_ids if c not in done]
+    if not todo:
+        print("所有指定电池已在缓存中，跳过")
+        return
+
+    # 追加写入：读已有数组 + 新数组拼接后重写。
+    x_path = cache_dir / "X.npy"
+    y_path = cache_dir / "y.npy"
+    cell_path = cache_dir / "cell_ids.npy"
+    x_all = np.load(x_path) if x_path.exists() else np.zeros((0, 101, 3), np.float32)
+    y_all = np.load(y_path) if y_path.exists() else np.zeros((0,), np.float32)
+    cell_all = (
+        np.load(cell_path, allow_pickle=True) if cell_path.exists()
+        else np.zeros((0,), dtype=object)
+    )
+
+    t0 = time.perf_counter()
+    for cell_id in todo:
+        x, y = build_cell_samples(cell_id, data_dir)
+        x_all = np.concatenate([x_all, x], axis=0)
+        y_all = np.concatenate([y_all, y], axis=0)
+        cell_all = np.concatenate(
+            [cell_all, np.full(len(x), cell_id, dtype=object)], axis=0
+        )
+        done.add(cell_id)
+        print(
+            f"[sit_cache] {cell_id}: {len(x):,} 片段, "
+            f"累计 {len(x_all):,} ({time.perf_counter() - t0:.0f}s)",
+            flush=True,
+        )
+
+    np.save(x_path, x_all)
+    np.save(y_path, y_all)
+    np.save(cell_path, cell_all)
+    meta = {
+        "cells": sorted(done),
+        "n": int(len(y_all)),
+        "shape_x": [int(x_all.shape[0]), 101, 3],
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[sit_cache] 完成: {len(x_all):,} 片段 -> {x_path}")
+
+
+def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=DEFAULT_SIT_DIR)
+    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument("--cells", default=None,
+                        help="只构建指定电池（逗号分隔）；默认全部 20 只")
+    args = parser.parse_args()
+
+    all_cells = discover_sit_cells(args.data_dir)["cell_id"].tolist()
+    cells = (
+        [c.strip() for c in args.cells.split(",") if c.strip()]
+        if args.cells else all_cells
+    )
+    missing = [c for c in cells if c not in all_cells]
+    if missing:
+        raise ValueError(f"未知电池: {missing}")
+    print(f"构建 {len(cells)} 只电池的缓存 ...")
+    build_cache(cells, args.data_dir, args.cache_dir)
+
+
+if __name__ == "__main__":
+    main()

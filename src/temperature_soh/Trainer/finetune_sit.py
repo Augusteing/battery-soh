@@ -38,6 +38,7 @@ SIT 标签口径：SOH(k) = Qc(k) / Qc_max（该电池全寿命最大充电容�
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -73,6 +74,7 @@ from sit_io import (  # noqa: E402
 
 DEFAULT_PRETRAINED = ROOT / "models" / "temperature_soh" / "normalized_3ch.pt"
 DEFAULT_OUT = ROOT / "models" / "temperature_soh" / "sit_fewshot.pt"
+DEFAULT_CACHE_DIR = ROOT / "data" / "processed" / "sit_cache"
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +144,36 @@ def build_cell_samples(
     if not x_list:
         raise ValueError(f"{cell_id} 没有生成任何片段")
     return np.stack(x_list), np.asarray(soh_list, dtype=np.float32)
+
+
+def load_cell_from_cache(
+    cell_id: str, cache_dir: Path
+) -> tuple[np.ndarray, np.ndarray]:
+    """从 sit_cache 读取一只电池的片段（秒级），无缓存则报错。"""
+    meta_path = cache_dir / "meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"缓存不存在: {cache_dir}（先运行 sit_cache.py）")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if cell_id not in set(meta.get("cells", [])):
+        raise KeyError(f"{cell_id} 不在缓存中（已缓存: {meta.get('cells')}）")
+
+    cells = np.load(cache_dir / "cell_ids.npy", allow_pickle=True)
+    rows = np.flatnonzero(cells == cell_id)
+    x = np.load(cache_dir / "X.npy", mmap_mode="r")[rows]
+    y = np.load(cache_dir / "y.npy")[rows]
+    return np.asarray(x), np.asarray(y)
+
+
+def get_cell_samples(
+    cell_id: str, data_dir: Path, cache_dir: Path | None
+) -> tuple[np.ndarray, np.ndarray]:
+    """优先读缓存（秒级），否则从 xlsx 构建（慢）。"""
+    if cache_dir is not None:
+        try:
+            return load_cell_from_cache(cell_id, cache_dir)
+        except (FileNotFoundError, KeyError):
+            print(f"  [提示] {cell_id} 不在缓存，回退 xlsx 构建（较慢）", flush=True)
+    return build_cell_samples(cell_id, data_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +247,7 @@ def evaluate(
     cell_ids: list[str],
     data_dir: Path,
     device: torch.device,
+    cache_dir: Path | None = None,
 ) -> dict[str, dict]:
     """在指定电池上评估，返回每只电池 + 汇总统计。"""
     model.eval()
@@ -226,7 +259,7 @@ def evaluate(
     temp_of = dict(zip(cells["cell_id"], cells["temp_group"]))
 
     for cell_id in cell_ids:
-        x, y = build_cell_samples(cell_id, data_dir)
+        x, y = get_cell_samples(cell_id, data_dir, cache_dir)
         # 分批前向，避免整只电池（4 万+ 片段）一次性上 GPU 导致 OOM。
         pred_parts: list[np.ndarray] = []
         for start in range(0, len(x), 4096):
@@ -296,6 +329,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pretrained", type=Path, default=DEFAULT_PRETRAINED)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_SIT_DIR)
+    parser.add_argument("--cache-dir", type=Path, default=None,
+                        help="SIT 片段缓存目录（先跑 sit_cache.py；存在则秒级读取）")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument(
         "--train-cells",
@@ -331,13 +366,15 @@ def main() -> None:
     if args.max_test_cells is not None:
         test_cells = test_cells[: args.max_test_cells]
     print(f"微调电池: {train_cells}  测试电池数: {len(test_cells)}")
+    if args.cache_dir is not None:
+        print(f"缓存目录: {args.cache_dir}")
 
     # 预加载微调数据
     print("构建 few-shot 微调片段 ...", flush=True)
     t0 = time.perf_counter()
     xs, ys = [], []
     for cell_id in train_cells:
-        x, y = build_cell_samples(cell_id, args.data_dir)
+        x, y = get_cell_samples(cell_id, args.data_dir, args.cache_dir)
         xs.append(x)
         ys.append(y)
         print(f"  {cell_id}: {len(x):,} 片段 ({time.perf_counter() - t0:.0f}s)", flush=True)
@@ -346,7 +383,7 @@ def main() -> None:
 
     finetune(model, x_train, y_train, args.epochs, args.lr, freeze, device)
 
-    rows = evaluate(model, test_cells, args.data_dir, device)
+    rows = evaluate(model, test_cells, args.data_dir, device, args.cache_dir)
     _print_report(rows)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
