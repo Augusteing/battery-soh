@@ -1,11 +1,19 @@
-"""temperature_soh 训练数据集（方案 A：惰性加载，4 通道）。
+"""temperature_soh 训练数据集（方案 A：惰性加载，支持温度标量）。
 
 本模块把 `segment_index.parquet`（统一片段索引表）包装成 PyTorch Dataset。
-与 partial_soh 的 PartialSohDataset 只有两处区别：
+与 partial_soh 的 PartialSohDataset 的区别：
 
   1. 输入是 **4 通道** `(I, V, Q, T')`，T 是温度曲线；
   2. 温度采用物理量纲归一化 `T' = (T - 25) / 10`，**不用全体 z-score**
      （z-score 会被 30°C 恒温主导，失去温度的物理含义）。
+
+温度嵌入（SOH 决策层融合）支持：
+
+  - SOH 任务额外返回循环级温度标量（摄氏度标量），供模型的
+    TemperatureEmbedding 使用（对齐 arXiv 2504.00393）；
+  - 标量来源 = 片段温度曲线均值（Severson 恒温数据上等价于
+    循环平均自热温度）；未来接入 SIT/电科院等有环境温度的
+    数据集时，可替换为真实的工况温度。
 
 核心思想（沿用方案 A 惰性加载）：
 
@@ -106,7 +114,7 @@ def _normalize_temperature(t: np.ndarray) -> np.ndarray:
 
 
 class TemperatureSohDataset(Dataset):
-    """按片段索引惰性生成 (输入, 标签) 的 4 通道 Dataset。"""
+    """按片段索引惰性生成 (输入, 标签[, 温度标量]) 的 Dataset。"""
 
     def __init__(
         self,
@@ -280,12 +288,13 @@ class TemperatureSohDataset(Dataset):
         return self._group_ids
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """返回 (x, y)。
+        """返回 (x, y[, 温度标量])。
 
         x : (101, 4) 的 float32 张量 [I, V, Q, T']；
         y : 取决于 task——
               soh      -> 标量 SOH，形状 ()；
-              pretrain -> (下一步电压 V[1:101] (100,), 未来窗 x_future (36, 4))。
+              pretrain -> (下一步电压 V[1:101] (100,), 未来窗 x_future (36, 4))；
+        soh 任务额外返回温度标量：本循环充电段的平均温度（摄氏度）。
         """
         cell_id = self.cell_ids[idx]
         cycle_index = int(self.cycle_indices[idx])
@@ -297,6 +306,14 @@ class TemperatureSohDataset(Dataset):
 
         if self.task == "soh":
             y = np.asarray(self.soh_values[idx], dtype=np.float32)
+            # 温度标量 = 充电段平均温度（摄氏度）。
+            # charge 是 (t, V, I, T, Qc) 元组，下标 3 为温度曲线。
+            temp_celsius = np.asarray(np.mean(charge[3]), dtype=np.float32)
+            return (
+                torch.from_numpy(x),
+                torch.from_numpy(y),
+                torch.from_numpy(temp_celsius),
+            )
         else:
             # 预训练目标：观测窗内电压序列后移一位作为“下一步电压”。
             y = x[1:, 1]
@@ -362,6 +379,9 @@ class MemmapSohDataset(Dataset):
         self._y = np.load(cache_dir / f"y_{split}.npy")
         self._pretrain_mask = np.load(cache_dir / f"is_valid_pretrain_{split}.npy")
         self._group_ids = np.load(cache_dir / f"group_ids_{split}.npy")
+        # 循环级温度标量（摄氏度）：SOH 决策层温度嵌入用。
+        # 若缓存里还没有，则从完整 4 通道缓存流式生成并落盘。
+        self._temp_scalars = self._load_or_build_temp_scalars(cache_dir, split, shape[0])
         self._x_future: np.ndarray | None = None
         if task == "pretrain":
             # 未来 7% 预测窗（36 点），只在预训练任务需要时载入。
@@ -393,12 +413,45 @@ class MemmapSohDataset(Dataset):
         """返回每个样本所属循环的编号（int64）。"""
         return self._group_ids
 
+    @staticmethod
+    def _load_or_build_temp_scalars(
+        cache_dir: Path, split: str, n_rows: int
+    ) -> np.ndarray:
+        """读取（或首次生成）片段级温度标量数组（摄氏度, float32）。
+
+        生成方式：从磁盘缓存 X_{split}.npy 的第 4 列（归一化温度 T'）
+        按片段求平均，再换算回摄氏度：T = T' * 10 + 25。
+
+        注意：这里用 memmap 读取，只加载温度列，不把整份 6.5GB
+        缓存读进内存；生成结果（约 16MB）落盘后下次直接读。
+        """
+        path = cache_dir / f"temp_scalars_{split}.npy"
+        if path.exists():
+            return np.load(path)
+        full = np.memmap(
+            str(cache_dir / f"X_{split}.npy"),
+            dtype=np.float32,
+            mode="r",
+            shape=(n_rows, 101, 4),
+        )
+        # memmap 按需读取：温度列每行 404 字节，共 n_rows 行。
+        t_norm_mean = full[..., 3].mean(axis=1)
+        t_celsius = (t_norm_mean * TEMP_SCALE_C + TEMP_CENTER_C).astype(np.float32)
+        np.save(path, t_celsius)
+        print(f"[dataset] 温度标量已生成并落盘: {path} "
+              f"(范围 {t_celsius.min():.2f}~{t_celsius.max():.2f}°C)", flush=True)
+        return t_celsius
+
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """返回 (x, y)，形状与 TemperatureSohDataset 完全一致。"""
+        """返回 (x, y[, 温度标量])，与 TemperatureSohDataset 一致。"""
         row = int(self._valid[idx])
         x = torch.from_numpy(np.array(self._x[row]))  # (101, 4)
         if self.task == "soh":
             y = torch.from_numpy(np.asarray(self._y[row]))  # 标量 SOH
+            temp_celsius = torch.from_numpy(
+                np.asarray(self._temp_scalars[row], dtype=np.float32)
+            )
+            return x, y, temp_celsius
         else:
             y = x[1:, 1]  # 下一步电压 V[1:101]
             x_future = torch.from_numpy(np.array(self._x_future[row]))  # (36, 4)
@@ -418,7 +471,10 @@ class MemmapSohDataset(Dataset):
         x = torch.from_numpy(self._x[rows])  # (B, 101, 4)
         if self.task == "soh":
             y = torch.from_numpy(np.asarray(self._y[rows]))  # (B,)
-            return x, y
+            temp_celsius = torch.from_numpy(
+                np.asarray(self._temp_scalars[rows], dtype=np.float32)
+            )  # (B,)
+            return x, y, temp_celsius
         else:
             y = x[:, 1:, 1]  # (B, 100)
             x_future = torch.from_numpy(self._x_future[rows])  # (B, 36, 4)

@@ -1,6 +1,6 @@
-"""temperature_soh 训练入口：电压预测预训练 + SOH 回归微调（4 通道）。
+"""temperature_soh 训练入口：电压预测预训练 + SOH 回归微调。
 
-两阶段流程（与 partial_soh / 原论文一致，仅输入改为 4 通道）：
+两阶段流程（与 partial_soh / 原论文一致，可选循环级温度嵌入）：
 
     阶段 1（预训练）：用电压预测任务训练编码器 + 电压头。
         目标 = 预测每个时间步的“下一步电压”（密集监督）
@@ -8,8 +8,11 @@
 
     阶段 2（微调）：  保留编码器权重，换 SOH 头，回归标量 SOH。
 
-默认超参数与 partial_soh 对齐：lr=1e-3, batch_size 可调，
-支持 --max-samples / --epochs 缩小规模做冒烟测试。
+温度嵌入（--temperature-embed，默认关闭）：
+    编码器只吃电学曲线 (I,V,Q)；循环级温度标量（默认 = 片段温度
+    均值，摄氏度）经 TemperatureEmbedding（EDD + FFN，对齐
+    arXiv 2504.00393）编码后，与 [h; c] 拼接再进 SOH 头。
+    预训练阶段不涉及温度，因此预训练权重与无温度版完全可比。
 
 运行：
 
@@ -17,8 +20,11 @@
 # 冒烟测试（小规模，几分钟内跑完）
 & "E:\conda\envs\battery-soh\python.exe" src/temperature_soh/Trainer/trainer.py --max-samples 300 --epochs 2
 
-# 全量训练（默认）
+# 全量训练：3 通道基线（默认）
 & "E:\conda\envs\battery-soh\python.exe" src/temperature_soh/Trainer/trainer.py
+
+# 全量训练：3 通道编码 + 循环级温度嵌入
+& "E:\conda\envs\battery-soh\python.exe" src/temperature_soh/Trainer/trainer.py --temperature-embed
 ```
 """
 
@@ -190,8 +196,13 @@ def finetune_soh(
     ckpt_path: Path | None = None,
     start_epoch: int = 1,
     optimizer: torch.optim.Optimizer | None = None,
+    use_temp_embed: bool = False,
 ) -> float:
-    """在 SOH 回归任务上微调，返回最后一个 epoch 的平均损失。"""
+    """在 SOH 回归任务上微调，返回最后一个 epoch 的平均损失。
+
+    loader 的 soh 样本是三元组 (x, y, temp_celsius)；开启温度嵌入时
+    temp_celsius 传给模型，否则忽略。
+    """
     if optimizer is None:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
@@ -201,11 +212,13 @@ def finetune_soh(
     for epoch in range(start_epoch, epochs + 1):
         total, n = 0.0, 0
         t0 = time.perf_counter()
-        for step, (x, y) in enumerate(loader, start=1):
+        for step, (x, y, temp_celsius) in enumerate(loader, start=1):
             x = x.to(device)
             y = y.to(device)          # (B,)
 
-            pred = model.soh_predict(x)  # (B,)
+            if use_temp_embed:
+                temp_celsius = temp_celsius.to(device)
+            pred = model.soh_predict(x, temp_celsius)  # (B,)
             loss = loss_fn(pred, y)
 
             optimizer.zero_grad()
@@ -232,14 +245,17 @@ def evaluate_mae(
     model: TemperatureSohLSTM,
     loader: DataLoader,
     device: torch.device,
+    use_temp_embed: bool = False,
 ) -> float:
     """在给定 DataLoader 上计算 SOH 预测的平均绝对误差（MAE）。"""
     model.eval()
     errors: list[float] = []
-    for x, y in loader:
+    for x, y, temp_celsius in loader:
         x = x.to(device)
         y = y.to(device)
-        pred = model.soh_predict(x)
+        if use_temp_embed:
+            temp_celsius = temp_celsius.to(device)
+        pred = model.soh_predict(x, temp_celsius)
         errors.append((pred - y).abs().cpu().numpy())
     model.train()
     if not errors:
@@ -270,7 +286,14 @@ def main() -> None:
                         help="从 --out 同名 .ckpt 断点续训")
     parser.add_argument("--channels", type=int, default=4, choices=(3, 4),
                         help="输入通道数：4=带温度 (I,V,Q,T)，3=无温度 (I,V,Q) 对照")
+    parser.add_argument("--temperature-embed", action="store_true",
+                        help="启用循环级温度嵌入（SOH 头输入 = [h;c] + 温度嵌入）")
+    parser.add_argument("--temp-scalar", default="mean", choices=("mean",),
+                        help="温度标量来源：mean=片段温度均值（当前唯一选项）")
     args = parser.parse_args()
+
+    if args.temperature_embed and args.temp_scalar != "mean":
+        raise ValueError(f"暂不支持温度标量来源: {args.temp_scalar}")
 
     cache_dir = Path(args.cache_dir) if args.cache_dir is not None else DEFAULT_CACHE_DIR
     use_cache = (cache_dir / "meta.json").exists()
@@ -290,7 +313,7 @@ def main() -> None:
 
     # ---- 阶段 1：电压预测预训练（train split）----
     print("=" * 60)
-    print("阶段 1：电压预测预训练（4 通道）")
+    print(f"阶段 1：电压预测预训练（{args.channels} 通道）")
     print("=" * 60)
     if use_cache:
         pretrain_ds = MemmapSohDataset(
@@ -309,9 +332,13 @@ def main() -> None:
         collate_fn=_identity_collate if use_cache else None,
     )
 
-    model = TemperatureSohLSTM(input_dim=args.channels).to(device)
+    model = TemperatureSohLSTM(
+        input_dim=args.channels,
+        use_temp_embed=args.temperature_embed,
+    ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"模型参数量: {n_params:,}  预训练样本数: {len(pretrain_ds):,}")
+    print(f"模型参数量: {n_params:,}  温度嵌入: {args.temperature_embed}  "
+          f"预训练样本数: {len(pretrain_ds):,}")
 
     ckpt_path = _ckpt_path(args.out)
     resume_stage = None
@@ -344,7 +371,7 @@ def main() -> None:
 
     # ---- 阶段 2：SOH 回归微调（train split）----
     print("=" * 60)
-    print("阶段 2：SOH 回归微调")
+    print(f"阶段 2：SOH 回归微调（温度嵌入: {args.temperature_embed}）")
     print("=" * 60)
     if use_cache:
         soh_ds = MemmapSohDataset(
@@ -369,6 +396,7 @@ def main() -> None:
             device, ckpt_path=ckpt_path,
             start_epoch=(resume_epoch + 1) if resume_stage == "finetune" else 1,
             optimizer=finetune_opt,
+            use_temp_embed=args.temperature_embed,
         )
     else:
         print("微调已完成，跳过（从 checkpoint 恢复）")
@@ -393,7 +421,9 @@ def main() -> None:
         num_workers=cfg.num_workers, drop_last=False,
         collate_fn=_identity_collate if use_cache else None,
     )
-    test_mae = evaluate_mae(model, test_loader, device)
+    test_mae = evaluate_mae(
+        model, test_loader, device, use_temp_embed=args.temperature_embed
+    )
     print(f"test MAE = {test_mae:.4f}  (样本数 {len(test_ds):,})")
 
     _save_model(args.out, model)
