@@ -77,28 +77,36 @@ def build_cache(
 
     t0 = time.perf_counter()
     for cell_id in todo:
-        x, y = build_cell_samples(cell_id, data_dir)
-        x_all = np.concatenate([x_all, x], axis=0)
-        y_all = np.concatenate([y_all, y], axis=0)
-        cell_all = np.concatenate(
-            [cell_all, np.full(len(x), cell_id, dtype=object)], axis=0
-        )
-        done.add(cell_id)
-        print(
-            f"[sit_cache] {cell_id}: {len(x):,} 片段, "
-            f"累计 {len(x_all):,} ({time.perf_counter() - t0:.0f}s)",
-            flush=True,
-        )
+        try:
+            x, y = build_cell_samples(cell_id, data_dir)
+            x_all = np.concatenate([x_all, x], axis=0)
+            y_all = np.concatenate([y_all, y], axis=0)
+            cell_all = np.concatenate(
+                [cell_all, np.full(len(x), cell_id, dtype=object)], axis=0
+            )
+            done.add(cell_id)
+            # 每构建完一只立即落盘：中途失败只丢当前电池，不丢已完成的。
+            np.save(x_path, x_all)
+            np.save(y_path, y_all)
+            np.save(cell_path, cell_all)
+            meta = {
+                "cells": sorted(done),
+                "n": int(len(y_all)),
+                "shape_x": [int(x_all.shape[0]), 101, 3],
+            }
+            meta_path.write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print(
+                f"[sit_cache] {cell_id}: {len(x):,} 片段, "
+                f"累计 {len(x_all):,} ({time.perf_counter() - t0:.0f}s)",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[sit_cache] {cell_id} 构建失败（已保存之前完成的电池）: {exc}",
+                  flush=True)
+            continue
 
-    np.save(x_path, x_all)
-    np.save(y_path, y_all)
-    np.save(cell_path, cell_all)
-    meta = {
-        "cells": sorted(done),
-        "n": int(len(y_all)),
-        "shape_x": [int(x_all.shape[0]), 101, 3],
-    }
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[sit_cache] 完成: {len(x_all):,} 片段 -> {x_path}")
 
 

@@ -262,12 +262,36 @@ def cell_temperature_c(
         if cell_row.empty:
             raise KeyError(f"未知电池: {cell_id}")
         device = str(cell_row.iloc[0]["device"])
-    cycle = read_charge_cycle(cell_id, 1, data_dir)
-    temps = np.asarray(cycle["temperature_in_C"], dtype=float)
-    temps = temps[np.isfinite(temps)]
-    if temps.size == 0:
-        raise ValueError(f"{cell_id} 第一个循环没有有效温度")
-    return float(np.median(temps))
+    data_dir = Path(data_dir or DEFAULT_SIT_DIR)
+    if device is None:
+        cell_row = discover_sit_cells(data_dir)
+        cell_row = cell_row[cell_row["cell_id"] == cell_id]
+        if cell_row.empty:
+            raise KeyError(f"未知电池: {cell_id}")
+        device = str(cell_row.iloc[0]["device"])
+
+    # 1) 优先：xlsx 内嵌温度（前 3 个循环找有效值，避开传感器未连接的循环）。
+    for cycle_number in (1, 2, 3):
+        try:
+            cycle = read_charge_cycle(cell_id, cycle_number, data_dir)
+            temps = np.asarray(cycle["temperature_in_C"], dtype=float)
+            temps = temps[np.isfinite(temps)]
+            if temps.size > 0:
+                return float(np.median(temps))
+        except Exception:
+            continue
+
+    # 2) 兜底：独立温度 CSV（Temperature/<cell>_temperature.csv）。
+    csv_path = data_dir / device / "Temperature" / f"{cell_id}_temperature.csv"
+    if csv_path.exists():
+        tdf = pd.read_csv(csv_path)
+        temp_cols = [c for c in tdf.columns if "temperature" in c.lower() and "C" in c]
+        for col in temp_cols:
+            vals = pd.to_numeric(tdf[col], errors="coerce").dropna()
+            if len(vals) > 0:
+                return float(vals.median())
+
+    raise ValueError(f"{cell_id} 找不到有效温度（xlsx 内嵌与 Temperature CSV 均无）")
 
 
 # ---------------------------------------------------------------------------
