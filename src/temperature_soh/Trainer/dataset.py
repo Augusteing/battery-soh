@@ -15,6 +15,12 @@
     循环平均自热温度）；未来接入 SIT/电科院等有环境温度的
     数据集时，可替换为真实的工况温度。
 
+跨电芯输入归一化（Severson 1.1 Ah 与 SIT 50 Ah 共用模型）：
+
+  - 通道 I 输出 **C-rate**（电流 ÷ 标称容量）；
+  - 通道 Q 输出 **SOC**（容量坐标 ÷ 标称容量）；
+  - V / T 是物理量，T 仍按 (T-25)/10 归一化。
+
 核心思想（沿用方案 A 惰性加载）：
 
     索引表只存“几何 + 标签”，不存曲线。训练时按需：
@@ -125,6 +131,7 @@ class TemperatureSohDataset(Dataset):
         cache_size: int | None = 8192,
         preload: bool = False,
         channels: int = 4,
+        nominal_capacity: float = 1.1,
     ) -> None:
         """初始化数据集。
 
@@ -145,6 +152,7 @@ class TemperatureSohDataset(Dataset):
 
         self.task = task
         self.channels = channels
+        self.nominal_capacity = nominal_capacity
         self.mat_dir = Path(mat_dir)
         self.files = discover_batch_files(self.mat_dir)
         # 一次性打开所有批次文件并复用句柄，避免每条曲线都重新 open/close。
@@ -257,11 +265,12 @@ class TemperatureSohDataset(Dataset):
             end_ah=float(end_ah),
         )
         # 通道顺序：[I, V, Q, T']。T 归一化到 (T-25)/10。
+        # 跨电芯归一化：I -> C-rate（÷标称容量），Q -> SOC（÷标称容量）。
         x = np.stack(
             [
-                seg["I"],
+                seg["I"] / self.nominal_capacity,
                 seg["V"],
-                seg["capacity"],
+                seg["capacity"] / self.nominal_capacity,
                 _normalize_temperature(seg["T"]),
             ],
             axis=1,

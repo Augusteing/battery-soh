@@ -24,7 +24,9 @@ cache_dir/
 与 partial_soh 版 build_cache 的区别：
   - 通道数 3 -> 4，增加归一化温度 T' = (T - 25) / 10；
   - 使用统一单位（I 安培、t 秒）后再提取充电段，与 dataset.py 一致；
-  - SOH 标签列名是 soh（temperature_soh 口径）。
+  - SOH 标签列名是 soh（temperature_soh 口径）；
+  - **输入跨电芯归一化**：I 除以标称容量 -> C-rate，Q 除以标称容量 -> SOC。
+    这是让 Severson（1.1 Ah）与 SIT（50 Ah）能共用同一模型的前置条件。
 
 用法
 ----
@@ -108,13 +110,21 @@ def _read_charge_curve(
     return charge
 
 
-def _stack_4channels(seg: dict[str, np.ndarray]) -> np.ndarray:
-    """把插值结果按 [I, V, Q, T'] 顺序堆叠成 (n_points, 4)。"""
+def _stack_4channels(
+    seg: dict[str, np.ndarray], nominal_capacity: float
+) -> np.ndarray:
+    """把插值结果按 [I, V, Q, T'] 顺序堆叠成 (n_points, 4)。
+
+    归一化规则（跨电芯可比的输入表示）：
+      - I 除以标称容量 -> C-rate（无量纲，与电芯规格无关）；
+      - Q（capacity 网格）除以标称容量 -> SOC ∈ [0, ~1]；
+      - V / T 是物理量，不缩放；T 再按 (T-25)/10 归一化。
+    """
     return np.stack(
         [
-            seg["I"],
+            seg["I"] / nominal_capacity,
             seg["V"],
-            seg["capacity"],
+            seg["capacity"] / nominal_capacity,
             (seg["T"] - TEMP_CENTER_C) / TEMP_SCALE_C,
         ],
         axis=1,
@@ -182,7 +192,7 @@ def build_split(
                 end_ah=float(row.end_ah),
                 nominal_capacity=nominal_capacity,
             )
-            x[pos] = _stack_4channels(seg)
+            x[pos] = _stack_4channels(seg, nominal_capacity)
             if row.is_valid_pretrain:
                 seg_future = interpolate_segment(
                     charge,
@@ -190,7 +200,7 @@ def build_split(
                     end_ah=float(row.pred_end_ah),
                     nominal_capacity=nominal_capacity,
                 )
-                x_future[pos] = _stack_4channels(seg_future)
+                x_future[pos] = _stack_4channels(seg_future, nominal_capacity)
             pos += 1
 
         n_groups += 1
