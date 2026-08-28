@@ -75,6 +75,7 @@ from sit_io import (  # noqa: E402
 DEFAULT_PRETRAINED = ROOT / "models" / "temperature_soh" / "normalized_3ch.pt"
 DEFAULT_OUT = ROOT / "models" / "temperature_soh" / "sit_fewshot.pt"
 DEFAULT_CACHE_DIR = ROOT / "data" / "processed" / "sit_cache"
+DEFAULT_MIN_SOH = 0.75
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +177,21 @@ def get_cell_samples(
     return build_cell_samples(cell_id, data_dir)
 
 
+def filter_by_soh(
+    x: np.ndarray, y: np.ndarray, min_soh: float | None
+) -> tuple[np.ndarray, np.ndarray]:
+    """只保留 SOH >= min_soh 的片段（与赛事/BMS 工作区间对齐）。
+
+    真实电车在 SOH 低于约 0.75~0.8 时就会报警更换，深衰减片段
+    既不符合比赛场景，也不在 Severson 训练分布内。默认过滤到
+    SOH > 0.75，让训练与评估都在常规老化区进行。
+    """
+    if min_soh is None:
+        return x, y
+    mask = y >= min_soh
+    return x[mask], y[mask]
+
+
 # ---------------------------------------------------------------------------
 # 微调
 # ---------------------------------------------------------------------------
@@ -248,6 +264,7 @@ def evaluate(
     data_dir: Path,
     device: torch.device,
     cache_dir: Path | None = None,
+    min_soh: float | None = DEFAULT_MIN_SOH,
 ) -> dict[str, dict]:
     """在指定电池上评估，返回每只电池 + 汇总统计。"""
     model.eval()
@@ -260,6 +277,16 @@ def evaluate(
 
     for cell_id in cell_ids:
         x, y = get_cell_samples(cell_id, data_dir, cache_dir)
+        x, y = filter_by_soh(x, y, min_soh)
+        if len(y) == 0:
+            rows[cell_id] = {
+                "temp_group": temp_of.get(cell_id, "?"),
+                "n": 0,
+                "mae": float("nan"),
+                "bias": float("nan"),
+                "mae_debiased": float("nan"),
+            }
+            continue
         # 分批前向，避免整只电池（4 万+ 片段）一次性上 GPU 导致 OOM。
         pred_parts: list[np.ndarray] = []
         for start in range(0, len(x), 4096):
@@ -344,6 +371,8 @@ def main() -> None:
                         help="只评估前 N 只测试电池（冒烟测试用）")
     parser.add_argument("--test-cells", default=None,
                         help="显式指定评估电池（逗号分隔，优先于自动选择）")
+    parser.add_argument("--min-soh", type=float, default=DEFAULT_MIN_SOH,
+                        help="只保留 SOH >= 该值的片段（默认 0.75，对齐赛事/BMS 区间）")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--freeze-encoder", action="store_true",
@@ -389,6 +418,7 @@ def main() -> None:
     xs, ys = [], []
     for cell_id in train_cells:
         x, y = get_cell_samples(cell_id, args.data_dir, args.cache_dir)
+        x, y = filter_by_soh(x, y, args.min_soh)
         xs.append(x)
         ys.append(y)
         print(f"  {cell_id}: {len(x):,} 片段 ({time.perf_counter() - t0:.0f}s)", flush=True)
@@ -400,7 +430,8 @@ def main() -> None:
     else:
         print("epochs=0：跳过微调，直接评估预训练模型（零样本对照）")
 
-    rows = evaluate(model, test_cells, args.data_dir, device, args.cache_dir)
+    rows = evaluate(model, test_cells, args.data_dir, device, args.cache_dir,
+                    min_soh=args.min_soh)
     _print_report(rows)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
