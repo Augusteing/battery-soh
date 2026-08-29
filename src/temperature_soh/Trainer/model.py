@@ -4,11 +4,15 @@
 **循环级温度嵌入**（默认关闭，`use_temp_embed=True` 时启用）：
 
     - 输入通道可选 3 或 4：`(I, V, Q)` 或 `(I, V, Q, T')`；
-    - 温度嵌入对齐 arXiv 2504.00393（钠离子电池多温度老化）：
-      循环级温度标量 T 归一化到 [0,1] 后，走两条路——
-        EDD 离散化查表：Embedding(floor(T' * N_T))；
-        FFN 连续变换：  小前馈网络；
-      拼接成 T_num = concat(EDD(T), FFN(T))，再拼到 SOH 头输入里。
+    - 温度嵌入升级为**曲线形状特征向量**（见 DataLoader/temp_features.py）：
+      SIT 温度传感器量化到 0.1°C，均值标量会丢掉"温度怎么变化"的信息，
+      因此把 101 点温度曲线压缩成 12 维形状特征（T_mean / ΔT / dT/dSOC
+      峰谷 / 峰值位置等），再走两条路（对齐 arXiv 2504.00393 的
+      EDD + FFN 双通道思想）——
+        EDD 离散化查表：用 T_mean 归一化后离散成温度档位，表达
+                        "环境 25°C / 恒温箱 40°C"这类分段规律；
+        FFN 连续变换：  吃完整 12 维特征向量，保留形状细节；
+      拼接成 T_num = concat(EDD(T_mean), FFN(features))，再拼到 SOH 头。
 
 设计原则：编码器（嵌入 + LSTM）只学电学曲线形态；温度是"决策层
 条件"，只在回归 SOH 时参与，因此预训练（电压预测）完全不受影响。
@@ -39,22 +43,23 @@ from torch import nn
 
 
 class TemperatureEmbedding(nn.Module):
-    """循环级温度标量嵌入（对齐 arXiv 2504.00393 的 EDD + FFN 双通道做法）。
+    """温度曲线形状特征嵌入（EDD + FFN 双通道，对齐 arXiv 2504.00393 思想）。
 
-    论文原式：
-
-        T'   = (T - T_min) / (T_max - T_min)      # 归一化到 [0,1]
-        EDD  = Embedding(floor(T' * N_T))          # 离散档位查表
-        T_num = concat(EDD(T); FFN(T))             # 与连续路径拼接
+    设计背景：
+      旧版输入是"循环级温度标量"（均值），在变温数据上丢失了形状信息。
+      新版输入是 DataLoader/temp_features.py 提取的 12 维形状特征向量：
+        T_mean / T_start / T_end / T_max / T_min / T_range / ΔT /
+        slope_T_vs_soc / dTdSOC_max / dTdSOC_min / pos_dTdSOC_max / pos_T_max。
 
     为什么双通道：
-      - 离散查表给模型"档位式"温度记忆（35°C 就是一个明确的类别），
-        适合表达"不同温度区间对应不同老化速率"这种分段规律；
-      - 连续 FFN 提供插值能力，33.7°C 也能平滑推断，不会因为
-        落在两个档位之间就失去精度。
+      - EDD 离散查表：只用 T_mean（特征 0）归一化后离散成 N_T 个温度档位，
+        表达"环境温度 ~25-35°C / 恒温箱 40°C"这种分段式环境标签；
+      - FFN 连续路径：吃完整 12 维标准化特征，保留温差、温升率、峰值位置
+        等形状细节，提供连续插值能力。
+      拼接后同时具备"档位记忆"与"形状感知"。
 
-    输入：循环级温度标量（摄氏度，float），形状 (B,) 或标量；
-    输出：温度嵌入向量，形状 (B, emb_dim * 2)。
+    输入：特征向量（物理单位，°C / °C/SOC / 位置），形状 (..., F)；
+    输出：温度嵌入向量，形状 (..., emb_dim * 2)。
     """
 
     def __init__(
@@ -62,7 +67,10 @@ class TemperatureEmbedding(nn.Module):
         emb_dim: int = 16,
         n_bins: int = 16,
         t_min: float = 0.0,
-        t_max: float = 45.0,
+        t_max: float = 55.0,
+        feature_dim: int = 12,
+        feature_center: tuple[float, ...] | None = None,
+        feature_scale: tuple[float, ...] | None = None,
     ) -> None:
         super().__init__()
         self.emb_dim = emb_dim
@@ -70,12 +78,30 @@ class TemperatureEmbedding(nn.Module):
         self.t_min = t_min
         self.t_max = t_max
 
-        # EDD：离散温度档位 -> 可学习向量。索引范围 [0, n_bins)。
+        # 每特征的归一化常数（物理定标，非统计量纲），与 temp_features.py
+        # 的 FEATURE_CENTER / FEATURE_SCALE 一致。调用方可显式传入。
+        if feature_center is None:
+            feature_center = (25.0,) * 5 + (0.0,) * 5 + (0.5, 0.5)
+        if feature_scale is None:
+            feature_scale = (10.0,) * 5 + (3.0, 3.0) + (8.0,) * 3 + (0.25, 0.25)
+        if len(feature_center) != feature_dim or len(feature_scale) != feature_dim:
+            raise ValueError(
+                f"feature_center/scale 长度必须等于 feature_dim={feature_dim}，"
+                f"实际 {len(feature_center)} / {len(feature_scale)}"
+            )
+        self.register_buffer(
+            "feature_center", torch.tensor(feature_center, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "feature_scale", torch.tensor(feature_scale, dtype=torch.float32)
+        )
+
+        # EDD：温度水平档位（用特征 0 = T_mean）-> 可学习向量。
         self.edd = nn.Embedding(n_bins, emb_dim)
 
-        # FFN：归一化温度标量 -> 同维度向量（与 EDD 输出可拼接）。
+        # FFN：完整特征向量（标准化后）-> 同维度向量（与 EDD 输出可拼接）。
         self.ffn = nn.Sequential(
-            nn.Linear(1, emb_dim),
+            nn.Linear(feature_dim, emb_dim),
             nn.ReLU(),
             nn.Linear(emb_dim, emb_dim),
         )
@@ -85,13 +111,17 @@ class TemperatureEmbedding(nn.Module):
         """温度嵌入输出维度 = EDD 与 FFN 两路拼接。"""
         return self.emb_dim * 2
 
-    def forward(self, t_celsius: torch.Tensor) -> torch.Tensor:
-        """把循环级温度标量编码成 (..., emb_dim*2) 向量。"""
-        t_norm = ((t_celsius - self.t_min) / (self.t_max - self.t_min)).clamp(0.0, 1.0)
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """把 (..., F) 温度形状特征编码成 (..., emb_dim*2) 向量。"""
+        t_mean = features[..., 0]  # 特征 0 = T_mean（°C）
+        t_norm = ((t_mean - self.t_min) / (self.t_max - self.t_min)).clamp(0.0, 1.0)
         # 离散档位索引：T'=1 时落到最后一个 bin（n_bins-1），不越界。
         bin_idx = torch.floor(t_norm * self.n_bins).long().clamp(0, self.n_bins - 1)
-        e_edd = self.edd(bin_idx)              # (..., emb_dim)
-        e_ffn = self.ffn(t_norm.unsqueeze(-1))  # (..., emb_dim)
+        e_edd = self.edd(bin_idx)  # (..., emb_dim)
+
+        # 标准化：减去物理零点、除以物理尺度，让 FFN 输入各维同量级。
+        z = (features - self.feature_center) / self.feature_scale
+        e_ffn = self.ffn(z)  # (..., emb_dim)
         return torch.cat([e_edd, e_ffn], dim=-1)
 
 
@@ -100,11 +130,13 @@ class TemperatureSohLSTM(nn.Module):
 
     参数
     ----
-    input_dim      : 输入通道数（3=I,V,Q；4=再加归一化温度 T'）。
-    use_temp_embed : 是否启用循环级温度嵌入（默认关闭，保持旧基线结构）。
-    temp_emb_dim   : 温度嵌入单路维度（EDD/FFN 各 temp_emb_dim，拼接后 2 倍）。
-    temp_bins      : EDD 离散档位数 N_T。
-    temp_range     : 温度归一化范围 (T_min, T_max)，默认 (0, 45)，对齐论文。
+    input_dim          : 输入通道数（3=I,V,Q；4=再加归一化温度 T'）。
+    use_temp_embed     : 是否启用温度形状特征嵌入（默认关闭，保持旧基线结构）。
+    temp_emb_dim       : 温度嵌入单路维度（EDD/FFN 各 temp_emb_dim，拼接后 2 倍）。
+    temp_bins          : EDD 离散档位数 N_T（T_mean 分档）。
+    temp_range         : T_mean 的离散化范围 (T_min, T_max)，°C。
+    temp_feature_dim   : 温度形状特征维度（temp_features.py 的 N_FEATURES=12）。
+    temp_feature_center/scale: 每特征的物理定标常数（与 temp_features.py 一致）。
     """
 
     def __init__(
@@ -117,7 +149,10 @@ class TemperatureSohLSTM(nn.Module):
         use_temp_embed: bool = False,
         temp_emb_dim: int = 16,
         temp_bins: int = 16,
-        temp_range: tuple[float, float] = (0.0, 45.0),
+        temp_range: tuple[float, float] = (0.0, 55.0),
+        temp_feature_dim: int = 12,
+        temp_feature_center: tuple[float, ...] | None = None,
+        temp_feature_scale: tuple[float, ...] | None = None,
     ) -> None:
         super().__init__()
         self.use_temp_embed = use_temp_embed
@@ -151,6 +186,9 @@ class TemperatureSohLSTM(nn.Module):
                 n_bins=temp_bins,
                 t_min=temp_range[0],
                 t_max=temp_range[1],
+                feature_dim=temp_feature_dim,
+                feature_center=temp_feature_center,
+                feature_scale=temp_feature_scale,
             )
             soh_in_dim += self.temperature_embed.out_dim
         self.soh_head = nn.Sequential(
@@ -193,22 +231,22 @@ class TemperatureSohLSTM(nn.Module):
         return self.voltage_head(lstm_out).squeeze(-1)
 
     def soh_predict(
-        self, x: torch.Tensor, temp_celsius: torch.Tensor | None = None
+        self, x: torch.Tensor, temp_features: torch.Tensor | None = None
     ) -> torch.Tensor:
         """用 [h; c]（可选 + 温度嵌入）回归标量 SOH。
 
         参数
         ----
-        x            : (B, T, input_dim) 电学曲线输入。
-        temp_celsius : (B,) 循环级温度标量（摄氏度）。仅
-                       use_temp_embed=True 时必需，否则会被忽略。
+        x             : (B, T, input_dim) 电学曲线输入。
+        temp_features : (B, F) 温度形状特征（物理单位），仅
+                        use_temp_embed=True 时必需，否则会被忽略。
         """
         _, h_n, c_n = self.encode(x)
         state = torch.cat([h_n[-1], c_n[-1]], dim=-1)  # (B, 128)
         if self.use_temp_embed:
-            if temp_celsius is None:
-                raise ValueError("use_temp_embed=True 时必须传入 temp_celsius")
-            t_emb = self.temperature_embed(temp_celsius)  # (B, 32)
+            if temp_features is None:
+                raise ValueError("use_temp_embed=True 时必须传入 temp_features")
+            t_emb = self.temperature_embed(temp_features)  # (B, 32)
             state = torch.cat([state, t_emb], dim=-1)
         return self.soh_head(state).squeeze(-1)
 
@@ -258,10 +296,10 @@ if __name__ == "__main__":
     n_params = sum(p.numel() for p in model.parameters())
     print(f"总参数量           : {n_params:,}")
 
-    # 温度嵌入冒烟测试：3 通道编码 + 循环级温度标量。
+    # 温度嵌入冒烟测试：3 通道编码 + 12 维温度形状特征。
     model_t = TemperatureSohLSTM(input_dim=3, use_temp_embed=True)
-    temp = torch.tensor([30.0, 35.0, 20.0, 45.0])
-    s_t = model_t.soh_predict(x, temp)
+    temp_feats = torch.randn(4, 12)
+    s_t = model_t.soh_predict(x, temp_feats)
     print(f"温度嵌入版 SOH     : {tuple(s_t.shape)}")
     print(f"温度嵌入参数量     : {sum(p.numel() for p in model_t.temperature_embed.parameters()):,}")
     print(f"温度嵌入版总参数量 : {sum(p.numel() for p in model_t.parameters()):,}")

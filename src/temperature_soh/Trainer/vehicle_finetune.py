@@ -49,6 +49,11 @@ from sit_io import (  # noqa: E402
     load_cycle_summary,
     read_charge_cycle,
 )
+from temp_features import (  # noqa: E402
+    FEATURE_CENTER,
+    FEATURE_SCALE,
+    extract_temp_shape_features,
+)
 
 DEFAULT_PRETRAINED = ROOT / "models" / "temperature_soh" / "normalized_3ch.pt"
 
@@ -56,12 +61,12 @@ DEFAULT_PRETRAINED = ROOT / "models" / "temperature_soh" / "normalized_3ch.pt"
 def build_cell_with_cycles(
     cell_id: str, data_dir: Path, min_soh: float | None = 0.75
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """读取单车全部片段，返回 (x, soh, cycle_ids, temp_celsius)。
+    """读取单车全部片段，返回 (x, soh, cycle_ids, temp_features)。
 
     与 finetune_sit.build_cell_samples 一致，但额外记录每个片段的
-    循环号（车辆时间序列切分需要）和循环级温度标量（摄氏度）。
-    温度标量 = 该循环充电段内嵌温度均值；内嵌全 NaN（如 Chroma 部分
-    循环传感器未连接）时用电池级代表温度（CSV 中位数）兜底。
+    循环号（车辆时间序列切分需要）和**片段级温度形状特征**（12 维，
+    见 temp_features.extract_temp_shape_features）。
+    温度曲线全 NaN 时用电池级代表温度兜底（整段常数温度）。
     """
     summary = load_cycle_summary(cell_id, data_dir)
     cycles = sorted(summary["Cycle"].unique().tolist())
@@ -83,10 +88,6 @@ def build_cell_with_cycles(
         soh = float(qc[cycles.index(cycle_number)]) / qc_max
         if min_soh is not None and soh < min_soh:
             continue
-        # 循环级温度标量：内嵌温度均值，全 NaN 用电池级中位数兜底。
-        temps = np.asarray(cycle["temperature_in_C"], dtype=float)
-        temps = temps[np.isfinite(temps)]
-        temp_scalar = float(np.mean(temps)) if temps.size else float(temperature_c)
         for row in index.itertuples(index=False):
             if not row.is_valid_soh:
                 continue
@@ -105,12 +106,20 @@ def build_cell_with_cycles(
             x_list.append(x)
             y_list.append(soh)
             cyc_list.append(int(cycle_number))
-            temp_list.append(temp_scalar)
+            # 片段级温度形状特征：同一循环的不同片段（起点不同）温度
+            # 曲线不同，因此特征逐片段提取，而不是循环级标量。
+            temp_list.append(
+                extract_temp_shape_features(
+                    seg,
+                    nominal_capacity=SIT_NOMINAL_CAPACITY_AH,
+                    fallback_temp_c=temperature_c,
+                )
+            )
     return (
         np.stack(x_list),
         np.asarray(y_list, dtype=np.float32),
         np.asarray(cyc_list, dtype=np.int64),
-        np.asarray(temp_list, dtype=np.float32),
+        np.stack(temp_list).astype(np.float32),
     )
 
 
@@ -150,12 +159,17 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--min-soh", type=float, default=0.75)
     parser.add_argument("--use-temp-embed", action="store_true",
-                        help="启用循环级温度嵌入（EDD+FFN），输入 = 3ch 片段 + 温度标量")
+                        help="启用温度形状特征嵌入（EDD+FFN，12 维曲线特征）")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TemperatureSohLSTM(input_dim=3, use_temp_embed=args.use_temp_embed,
-                               temp_range=(0.0, 55.0))
+    model = TemperatureSohLSTM(
+        input_dim=3,
+        use_temp_embed=args.use_temp_embed,
+        temp_range=(0.0, 55.0),
+        temp_feature_center=FEATURE_CENTER,
+        temp_feature_scale=FEATURE_SCALE,
+    )
     ckpt = torch.load(args.pretrained, map_location="cpu", weights_only=True)
     if args.use_temp_embed:
         # 预训练模型是 3ch 无温度版（SOH 头 128 维输入）；温度版 SOH 头
@@ -175,8 +189,10 @@ def main() -> None:
     x, y, cyc, temp = build_cell_with_cycles(args.cell, args.data_dir, args.min_soh)
     print(f"读取 {len(x):,} 片段 ({time.perf_counter() - t0:.0f}s)", flush=True)
     if args.use_temp_embed:
-        print(f"循环级温度标量: {temp.min():.1f} ~ {temp.max():.1f}°C "
-              f"(中位 {np.median(temp):.1f})")
+        print(f"温度形状特征 ({temp.shape[1]} 维): "
+              f"T_mean {temp[:, 0].min():.1f}~{temp[:, 0].max():.1f}°C, "
+              f"ΔT {temp[:, 6].min():.1f}~{temp[:, 6].max():.1f}°C, "
+              f"dT/dSOC_max {temp[:, 8].min():.1f}~{temp[:, 8].max():.1f}")
 
     train_mask = cyc <= args.split_cycle
     test_mask = cyc > args.split_cycle
