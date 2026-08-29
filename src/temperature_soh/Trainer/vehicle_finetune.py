@@ -12,12 +12,19 @@
 用法：
 ```powershell
 & "E:\conda\envs\battery-soh\python.exe" src/temperature_soh/Trainer/vehicle_finetune.py --cell 001-2 --split-cycle 300
+& "E:\conda\envs\battery-soh\python.exe" src/temperature_soh/Trainer/vehicle_finetune.py --cell 001-2 --split-cycle 300 --use-temp-embed --phys-lambda 0.1
 ```
+
+物理约束（--phys-lambda > 0 时启用，见 physics_loss.py）：
+  每个 epoch 在逐片段数据损失之后，对训练集做一次完整前向，把预测按
+  循环号聚合成循环级 SOH 轨迹，计算 单调性 + 有界性 + 同循环一致性
+  三个损失并反向更新。总损失 = L_data + λ_phys * (L_mono + L_bounds + L_cons)。
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -35,6 +42,7 @@ for d in (TR_DIR, DL_DIR):
 
 from dataset import TEMP_CENTER_C, TEMP_SCALE_C  # noqa: E402
 from model import TemperatureSohLSTM  # noqa: E402
+from physics_loss import cycle_physics_losses  # noqa: E402
 from segments import (  # noqa: E402
     OBSERVED_CAPACITY_PCT,
     PREDICTION_CAPACITY_PCT,
@@ -147,6 +155,39 @@ def evaluate(
     }
 
 
+def physics_step(
+    model: TemperatureSohLSTM,
+    x: torch.Tensor,
+    temp: torch.Tensor | None,
+    cyc: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    use_temp_embed: bool,
+    phys_lambda: float,
+) -> dict[str, float]:
+    """训练集一次完整前向，聚合出三个物理损失并反向更新。
+
+    返回各损失分量的数值（供打印与落盘）。
+    """
+    model.train()
+    preds = []
+    for start in range(0, len(x), 4096):
+        xb = x[start : start + 4096].to(device)
+        tb = temp[start : start + 4096].to(device) if use_temp_embed else None
+        preds.append(model.soh_predict(xb, tb))
+    pred = torch.cat(preds)
+
+    losses = cycle_physics_losses(pred, cyc.to(device))
+    total = (
+        losses["mono"] + losses["bounds"] + losses["consistency"]
+    ) * phys_lambda
+    optimizer.zero_grad()
+    total.backward()
+    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    return {k: float(v.item()) for k, v in losses.items()}
+
+
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
@@ -160,6 +201,10 @@ def main() -> None:
     parser.add_argument("--min-soh", type=float, default=0.75)
     parser.add_argument("--use-temp-embed", action="store_true",
                         help="启用温度形状特征嵌入（EDD+FFN，12 维曲线特征）")
+    parser.add_argument("--phys-lambda", type=float, default=0.1,
+                        help="物理约束总权重（0 = 关闭；默认 0.1，沿用世界模型论文）")
+    parser.add_argument("--out-json", type=Path, default=None,
+                        help="结果落盘路径（metrics JSON），不传则不保存")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -200,10 +245,15 @@ def main() -> None:
     x_test, y_test = torch.from_numpy(x[test_mask]), torch.from_numpy(y[test_mask])
     temp_train = torch.from_numpy(temp[train_mask]) if args.use_temp_embed else None
     temp_test = torch.from_numpy(temp[test_mask]) if args.use_temp_embed else None
+    cyc_train = torch.from_numpy(cyc[train_mask])
     print(f"车辆历史（cycle ≤ {args.split_cycle}）: {len(x_train):,} 片段, "
           f"SOH {y_train.min():.3f}~{y_train.max():.3f}")
     print(f"车辆未来（cycle > {args.split_cycle}）: {len(x_test):,} 片段, "
           f"SOH {y_test.min():.3f}~{y_test.max():.3f}")
+    if args.phys_lambda > 0:
+        n_cycles = int(torch.unique(cyc_train).numel())
+        print(f"物理约束: λ={args.phys_lambda}  训练段 {n_cycles} 个循环 "
+              f"（单调+有界+同循环一致性）", flush=True)
 
     # 1) 零样本（不微调）在车辆未来上的表现。
     zero = evaluate(model, x_test, y_test, temp_test, device, args.use_temp_embed)
@@ -230,9 +280,20 @@ def main() -> None:
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             total += float(loss.item()) * len(idx)
+        # 物理约束阶段：聚合循环级轨迹，反向更新（不参与数据损失）。
+        if args.phys_lambda > 0:
+            phys = physics_step(
+                model, x_train, temp_train, cyc_train,
+                optimizer, device, args.use_temp_embed, args.phys_lambda,
+            )
         if epoch % 10 == 0 or epoch == args.epochs:
+            extra = ""
+            if args.phys_lambda > 0:
+                extra = (f"  phys mono={phys['mono']:.2e} "
+                         f"bounds={phys['bounds']:.2e} "
+                         f"cons={phys['consistency']:.2e}")
             print(f"  [vehicle-finetune] epoch {epoch:3d}/{args.epochs}  "
-                  f"loss={total / n:.6f}", flush=True)
+                  f"loss={total / n:.6f}{extra}", flush=True)
 
     finetuned = evaluate(model, x_test, y_test, temp_test, device, args.use_temp_embed)
     print(f"车辆微调后（用该车前 {args.split_cycle} 循环）: "
@@ -240,6 +301,32 @@ def main() -> None:
           f"去偏={finetuned['mae_debiased'] * 100:.2f}%")
     print(f"提升: MAE {zero['mae'] * 100:.2f}% → {finetuned['mae'] * 100:.2f}% "
           f"（{- (finetuned['mae'] - zero['mae']) * 100:+.2f}pp）")
+
+    if args.out_json is not None:
+        args.out_json.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "cell": args.cell,
+            "split_cycle": args.split_cycle,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "use_temp_embed": args.use_temp_embed,
+            "phys_lambda": args.phys_lambda,
+            "n_train_segments": int(len(x_train)),
+            "n_test_segments": int(len(x_test)),
+            "train_soh_range": [float(y_train.min()), float(y_train.max())],
+            "test_soh_range": [float(y_test.min()), float(y_test.max())],
+            "zero_shot_mae_pct": round(zero["mae"] * 100, 4),
+            "finetuned_mae_pct": round(finetuned["mae"] * 100, 4),
+            "finetuned_bias_pct": round(finetuned["bias"] * 100, 4),
+            "finetuned_mae_debiased_pct": round(
+                finetuned["mae_debiased"] * 100, 4
+            ),
+        }
+        args.out_json.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"结果已保存: {args.out_json}", flush=True)
 
 
 if __name__ == "__main__":
