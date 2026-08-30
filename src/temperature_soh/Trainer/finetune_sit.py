@@ -328,7 +328,7 @@ def finetune(
         total, n_batches = 0.0, 0
         model.train()
         for start in range(0, n, batch_size):
-            idx = perm[start : start + 4096]
+            idx = perm[start : start + batch_size]
             xb, yb = x_train[idx], y_train[idx]
             tb = temp_train[idx] if use_temp_embed else None
             pred = model.soh_predict(xb, tb)
@@ -340,20 +340,34 @@ def finetune(
             total += float(loss.item()) * len(idx)
             n_batches += 1
 
-        # 物理约束阶段：训练集完整前向，按 (电池, 循环) 聚合后计算
-        # 单调性 + 有界性 + 同循环一致性，再做一次反向更新。
+        # 物理约束阶段：按 (电池, 循环) 聚合后计算单调性 + 有界性 +
+        # 同循环一致性，再做一次反向更新。
+        # 注意：编码器可训练（从头训练）时，全量前向会同时保留整个
+        # 训练集的 LSTM 反向图（pred 全部 cat 后统一 backward），6GB
+        # 显存放不下，因此只在一个随机子集上计算（minibatch 正则化）。
         phys_info = ""
         if phys_lambda > 0:
             if cyc_key_train is None:
                 raise ValueError("phys_lambda>0 时必须提供 cyc_key_train")
             model.train()
+            if not freeze_encoder and n > 8192:
+                phys_idx = torch.randperm(n, device=device)[:8192]
+                x_phys = x_train[phys_idx]
+                t_phys = temp_train[phys_idx] if use_temp_embed else None
+                c_phys = cyc_key_train[phys_idx]
+                phys_n = 8192
+            else:
+                x_phys = x_train
+                t_phys = temp_train
+                c_phys = cyc_key_train
+                phys_n = n
             preds: list[torch.Tensor] = []
-            for start in range(0, n, batch_size):
-                xb = x_train[start : start + 4096]
-                tb = temp_train[start : start + 4096] if use_temp_embed else None
+            for start in range(0, phys_n, batch_size):
+                xb = x_phys[start : start + batch_size]
+                tb = t_phys[start : start + batch_size] if use_temp_embed else None
                 preds.append(model.soh_predict(xb, tb))
             pred_all = torch.cat(preds)
-            losses = cycle_physics_losses(pred_all, cyc_key_train)
+            losses = cycle_physics_losses(pred_all, c_phys)
             phys_loss = (
                 losses["mono"] + losses["bounds"] + losses["consistency"]
             ) * phys_lambda
