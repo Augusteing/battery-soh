@@ -45,38 +45,42 @@ A_TRAIN = ["001-6","001-7","001-1","001-8","001-4","001-3","001-5",
            "002-5","003-5","002-3","003-1","002-7","003-7","003-3"]
 A_TEST  = ["101-3","001-2","101-1","002-4","002-1","002-2"]
 
-# (名称, 训练电池, 测试电池, init, 温度嵌入, 方式, 物理λ, epochs, 相对特征, 分桶加权)
-CONFIGS: list[tuple[str, list[str], list[str], str, bool, str, float, int, bool, bool]] = [
-    ("A-trans",       A_TRAIN, A_TEST, "pretrained", True,  "concat", 0.1, 30, False, False),
-    ("A-trans-nt",    A_TRAIN, A_TEST, "pretrained", False, "concat", 0.1, 30, False, False),
-    ("A-scratch",     A_TRAIN, A_TEST, "random",     True,  "concat", 0.1, 30, False, False),
+# (名称, 训练, 测试, init, 温度, 方式, 物理λ, epochs, 相对, 分桶, 对比λ)
+CONFIGS: list[tuple[str, list[str], list[str], str, bool, str, float, int, bool, bool, float]] = [
+    ("A-trans",       A_TRAIN, A_TEST, "pretrained", True,  "concat", 0.1, 30, False, False, 0.0),
+    ("A-trans-nt",    A_TRAIN, A_TEST, "pretrained", False, "concat", 0.1, 30, False, False, 0.0),
+    ("A-scratch",     A_TRAIN, A_TEST, "random",     True,  "concat", 0.1, 30, False, False, 0.0),
     # A 组条件调制对照：FiLM + 相对特征（不加权基线），及其分桶加权版。
     # 用于检验"同分布场景下逆频率加权是否对症"（B1 跨温度场景净效应为负）。
-    ("A-film-rel",    A_TRAIN, A_TEST, "pretrained", True,  "film", 0.1, 30, True,  False),
-    ("A-film-rel-bw", A_TRAIN, A_TEST, "pretrained", True,  "film", 0.1, 30, True,  True),
-    ("B1-trans",      AMBIENT, CHAMBER, "pretrained", True,  "concat", 0.1, 30, False, False),
+    ("A-film-rel",    A_TRAIN, A_TEST, "pretrained", True,  "film", 0.1, 30, True,  False, 0.0),
+    ("A-film-rel-bw", A_TRAIN, A_TEST, "pretrained", True,  "film", 0.1, 30, True,  True,  0.0),
+    ("B1-trans",      AMBIENT, CHAMBER, "pretrained", True,  "concat", 0.1, 30, False, False, 0.0),
     # 诊断消融：B1 带温度，但只保留相对形状特征（抹掉绝对温度水平），
     # 用于检验"绝对温度 = 电池身份捷径"（B1-trans 9.76% vs trans-nt 5.54%）。
-    ("B1-trans-rel",  AMBIENT, CHAMBER, "pretrained", True,  "concat", 0.1, 30, True,  False),
+    ("B1-trans-rel",  AMBIENT, CHAMBER, "pretrained", True,  "concat", 0.1, 30, True,  False, 0.0),
     # 条件调制版：FiLM（温度生成 γ、β 调制表征）+ 相对特征消融。
     # 预期：抑制"绝对温度 = 身份"捷径，同时保留温度的调节能力。
-    ("B1-film-rel",   AMBIENT, CHAMBER, "pretrained", True,  "film", 0.1, 30, True,  False),
+    ("B1-film-rel",   AMBIENT, CHAMBER, "pretrained", True,  "film", 0.1, 30, True,  False, 0.0),
     # 分桶逆频率加权：与 B1-film-rel 唯一区别是损失按老化阶段加权，
     # 用于检验"健康段低估 / 深老化段高估"（向均值回归）是否被缓解。
-    ("B1-film-rel-bw", AMBIENT, CHAMBER, "pretrained", True, "film", 0.1, 30, True, True),
-    ("B1-trans-nt",   AMBIENT, CHAMBER, "pretrained", False, "concat", 0.1, 30, False, False),
-    ("B1-scratch",    AMBIENT, CHAMBER, "random",     True,  "concat", 0.1, 30, False, False),
-    ("B2-trans",      CHAMBER, AMBIENT, "pretrained", True,  "concat", 0.1, 30, False, False),
-    ("B2-trans-nt",   CHAMBER, AMBIENT, "pretrained", False, "concat", 0.1, 30, False, False),
-    ("B2-scratch",    CHAMBER, AMBIENT, "random",     True,  "concat", 0.1, 30, False, False),
+    ("B1-film-rel-bw", AMBIENT, CHAMBER, "pretrained", True, "film", 0.1, 30, True, True, 0.0),
+    # 同循环片段对比学习：B1 条件调制版 + 对比损失（λ=0.1）。
+    # 同一循环不同起点片段作为正样本对，把表征对齐到共享退化状态。
+    ("B1-film-rel-cl", AMBIENT, CHAMBER, "pretrained", True, "film", 0.1, 30, True, False, 0.1),
+    ("B1-trans-nt",   AMBIENT, CHAMBER, "pretrained", False, "concat", 0.1, 30, False, False, 0.0),
+    ("B1-scratch",    AMBIENT, CHAMBER, "random",     True,  "concat", 0.1, 30, False, False, 0.0),
+    ("B2-trans",      CHAMBER, AMBIENT, "pretrained", True,  "concat", 0.1, 30, False, False, 0.0),
+    ("B2-trans-nt",   CHAMBER, AMBIENT, "pretrained", False, "concat", 0.1, 30, False, False, 0.0),
+    ("B2-scratch",    CHAMBER, AMBIENT, "random",     True,  "concat", 0.1, 30, False, False, 0.0),
     # 零样本全量：一次测评全部 20 只，各视角按测试电池过滤。
-    ("zero-all",      [],      AMBIENT + CHAMBER, "pretrained", False, "concat", 0.0, 0, False, False),
+    ("zero-all",      [],      AMBIENT + CHAMBER, "pretrained", False, "concat", 0.0, 0, False, False, 0.0),
 ]
 
 
 def run_one(name: str, train: list[str], test: list[str], init: str,
             use_temp: bool, temp_mode: str, phys: float, epochs: int,
-            relative_only: bool, bucket_weight: bool) -> int:
+            relative_only: bool, bucket_weight: bool,
+            contrastive_lambda: float) -> int:
     """跑一个配置，日志落盘，返回子进程退出码。"""
     cmd = [
         PYTHON, str(SCRIPT),
@@ -96,6 +100,8 @@ def run_one(name: str, train: list[str], test: list[str], init: str,
         cmd.append("--relative-only")
     if bucket_weight:
         cmd.append("--bucket-weight")
+    if contrastive_lambda > 0:
+        cmd += ["--contrastive-lambda", str(contrastive_lambda)]
     if phys > 0:
         cmd += ["--phys-lambda", str(phys)]
     # 从头训练（init=random）要训练编码器，LSTM 反向图大，

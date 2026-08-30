@@ -46,6 +46,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 ROOT = Path(__file__).resolve().parents[3]
 TR_DIR = Path(__file__).resolve().parent
@@ -324,6 +325,67 @@ def inverse_frequency_weights(
     return w.float()
 
 
+def group_samples_by_cycle(
+    cyc_key: torch.Tensor,
+) -> dict[int, list[int]]:
+    """按复合循环键分组，返回 {循环键: [样本索引列表]}。
+
+    同循环（同电池、同循环号）的所有片段——不同容量起点的窗口——
+    共享同一个退化状态与同一个 SOH 标签。对比学习用它们构造
+    "正样本对"（同一循环的两个片段应映射到相近的表征）。
+    """
+    ck = cyc_key.cpu().numpy()
+    order = np.argsort(ck, kind="stable")          # 按键排序
+    sorted_ck = ck[order]
+    split = np.flatnonzero(np.diff(sorted_ck) != 0) + 1  # 组边界
+    groups: dict[int, list[int]] = {}
+    start = 0
+    for end in np.concatenate([split, [len(ck)]]):
+        groups[int(sorted_ck[start])] = order[start:end].tolist()
+        start = int(end)
+    return groups
+
+
+def contrastive_loss(
+    z: torch.Tensor, tau: float = 0.1
+) -> torch.Tensor:
+    """同循环片段对比损失（InfoNCE / NT-Xent 形式）。
+
+    输入 z 形状 (B, d)，约定样本按"正样本对相邻"排列：
+    (2i, 2i+1) 是同一循环的两个片段（正对），其余是负样本。
+
+    对每个样本 i：
+      L_i = -log( exp(sim(z_i, z_p)/τ) / Σ_{j≠i} exp(sim(z_i, z_j)/τ) )
+    其中 sim 是余弦相似度，τ 是温度系数。
+    含义：把"与正样本相似"的概率最大化，等价于把同循环片段的
+    表征拉近、不同循环片段推远。τ 越小，对相似度差异越敏感。
+
+    直观理解：50 个片段像 50 个证人描述同一事故，对比损失强迫
+    模型把这些"零散描述"映射到表征空间里的同一点附近。
+    """
+    z = F.normalize(z, dim=-1)          # 余弦相似度前的 L2 归一化
+    sim = z @ z.T / tau                 # (B, B) 相似度矩阵
+    b = z.size(0)
+    if b % 2 != 0:
+        raise ValueError("对比损失要求 batch 内样本数为偶数（正对相邻）")
+
+    # 正样本索引：样本 2i 与 2i+1 互为对方。
+    pos_idx = torch.arange(0, b, 2, device=z.device)
+    pairs = torch.stack([pos_idx, pos_idx + 1], dim=1)  # (B/2, 2)
+
+    # 分母：对所有 j≠i 求 log-sum-exp（排除自己，sim[i,i]=1 不能算进去）。
+    mask = ~torch.eye(b, dtype=torch.bool, device=z.device)
+    log_denom = torch.logsumexp(
+        sim.masked_fill(~mask, -float("inf")), dim=1
+    )
+
+    # 分子：正样本相似度的对数（双向各算一次再平均）。
+    log_num = sim[pairs[:, 0], pairs[:, 1]]
+    l_01 = -(log_num - log_denom[pairs[:, 0]])
+    l_10 = -(log_num - log_denom[pairs[:, 1]])
+    return (l_01 + l_10).mean()
+
+
 # ---------------------------------------------------------------------------
 # 微调
 # ---------------------------------------------------------------------------
@@ -343,6 +405,8 @@ def finetune(
     phys_lambda: float = 0.0,
     batch_size: int = 4096,
     bucket_weight: bool = False,
+    contrastive_lambda: float = 0.0,
+    contrastive_tau: float = 0.1,
 ) -> None:
     """在 SIT 片段上微调模型（全量数据已在内存，一个 epoch 一次前向）。
 
@@ -374,6 +438,13 @@ def finetune(
     if cyc_key_train is not None:
         cyc_key_train = cyc_key_train.to(device)
     n = len(x_train)
+    groups: dict[int, list[int]] = {}
+    if contrastive_lambda > 0:
+        if cyc_key_train is None:
+            raise ValueError("contrastive_lambda>0 时必须提供 cyc_key_train")
+        groups = group_samples_by_cycle(cyc_key_train)
+        print(f"对比学习: {len(groups):,} 个循环可作正样本组，"
+              f"λ={contrastive_lambda} τ={contrastive_tau}", flush=True)
     w_train = inverse_frequency_weights(y_train) if bucket_weight else None
     if w_train is not None:
         edges_t = torch.tensor(BUCKET_EDGES, device=y_train.device)
@@ -385,15 +456,37 @@ def finetune(
               f"边界 {list(BUCKET_EDGES)}", flush=True)
     print(f"微调样本数: {n:,}  冻结编码器: {freeze_encoder}  "
           f"lr(头)={lr}  温度嵌入: {use_temp_embed}  "
-          f"物理约束λ: {phys_lambda}  分桶加权: {bucket_weight}", flush=True)
+          f"物理约束λ: {phys_lambda}  分桶加权: {bucket_weight}  "
+          f"对比λ: {contrastive_lambda}", flush=True)
 
     for epoch in range(1, epochs + 1):
-        # 每个 epoch 打乱顺序，按 batch 切分。
-        perm = torch.randperm(n)
+        # 两种采样模式：
+        #  - 对比模式（contrastive_lambda>0）：按循环分组，每批随机取
+        #    batch_size//2 个循环、每循环随机取 2 个片段（正样本对）；
+        #  - 普通模式：全量打乱后线性切 batch。
+        if contrastive_lambda > 0:
+            cyc_keys_all = list(groups.keys())
+            cyc_perm = torch.randperm(len(cyc_keys_all))
+            g_per_batch = max(1, batch_size // 2)
+            batch_idx_list: list[torch.Tensor] = []
+            for s in range(0, len(cyc_keys_all), g_per_batch):
+                idxs: list[int] = []
+                for pos in cyc_perm[s : s + g_per_batch].tolist():
+                    members = groups[cyc_keys_all[pos]]
+                    if len(members) >= 2:
+                        idxs.extend(
+                            np.random.choice(members, 2, replace=False).tolist()
+                        )
+                if idxs:
+                    batch_idx_list.append(torch.tensor(idxs))
+        else:
+            perm = torch.randperm(n)
+            batch_idx_list = [
+                perm[s : s + batch_size] for s in range(0, n, batch_size)
+            ]
         total, n_batches = 0.0, 0
         model.train()
-        for start in range(0, n, batch_size):
-            idx = perm[start : start + batch_size]
+        for idx in batch_idx_list:
             xb, yb = x_train[idx], y_train[idx]
             tb = temp_train[idx] if use_temp_embed else None
             pred = model.soh_predict(xb, tb)
@@ -402,6 +495,12 @@ def finetune(
                 loss = torch.mean(w_train[idx] * (pred - yb) ** 2)
             else:
                 loss = loss_fn(pred, yb)
+            if contrastive_lambda > 0:
+                # 对比损失：同循环片段（2i, 2i+1）表征拉近，异循环推开。
+                _, h_n, c_n = model.encode(xb)
+                z = torch.cat([h_n[-1], c_n[-1]], dim=-1)  # (B, 128)
+                cl_loss = contrastive_loss(z, contrastive_tau)
+                loss = loss + contrastive_lambda * cl_loss
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -642,6 +741,12 @@ def main() -> None:
                         help="老化阶段逆频率加权：按真实 SOH 分桶，样本少的"
                              "桶（健康段/深老化段）在损失里权重更高，缓解"
                              "'向均值回归'（对齐 2603.10527 的 inverse-frequency）")
+    parser.add_argument("--contrastive-lambda", type=float, default=0.0,
+                        help="同循环片段对比学习损失权重（0 = 关闭）。"
+                             "同一循环不同起点片段共享同一退化状态，"
+                             "作为正样本对拉近表征，异循环片段推开")
+    parser.add_argument("--contrastive-tau", type=float, default=0.1,
+                        help="对比损失温度系数（越小对相似度差异越敏感）")
     args = parser.parse_args()
 
     if args.freeze_encoder and args.unfreeze_encoder:
@@ -713,7 +818,7 @@ def main() -> None:
         xs, ys = [], []
         temps, cyc_keys = [], []
         for cell_id in train_cells:
-            if args.use_temp_embed or args.phys_lambda > 0:
+            if args.use_temp_embed or args.phys_lambda > 0 or args.contrastive_lambda > 0:
                 x, y, temp, cyc = get_cell_samples_full(
                     cell_id, args.data_dir, args.cache_dir
                 )
@@ -756,6 +861,8 @@ def main() -> None:
             phys_lambda=args.phys_lambda,
             batch_size=args.batch_size,
             bucket_weight=args.bucket_weight,
+            contrastive_lambda=args.contrastive_lambda,
+            contrastive_tau=args.contrastive_tau,
         )
     else:
         print("epochs=0：跳过微调，直接评估预训练模型（零样本对照）")
