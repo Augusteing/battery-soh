@@ -79,6 +79,10 @@ def run_one(name: str, train: list[str], test: list[str], init: str,
         cmd.append("--use-temp-embed")
     if phys > 0:
         cmd += ["--phys-lambda", str(phys)]
+    # 从头训练（init=random）要训练编码器，LSTM 反向图大，
+    # batch 4096 在 6GB 显卡上会 OOM，降到 1024。
+    if init == "random":
+        cmd += ["--batch-size", "1024"]
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     PRED_DIR.mkdir(parents=True, exist_ok=True)

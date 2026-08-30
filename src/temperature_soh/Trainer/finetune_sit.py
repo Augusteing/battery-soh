@@ -290,6 +290,7 @@ def finetune(
     cyc_key_train: torch.Tensor | None = None,
     use_temp_embed: bool = False,
     phys_lambda: float = 0.0,
+    batch_size: int = 4096,
 ) -> None:
     """在 SIT 片段上微调模型（全量数据已在内存，一个 epoch 一次前向）。"""
     torch.manual_seed(seed)
@@ -326,7 +327,7 @@ def finetune(
         perm = torch.randperm(n)
         total, n_batches = 0.0, 0
         model.train()
-        for start in range(0, n, 4096):
+        for start in range(0, n, batch_size):
             idx = perm[start : start + 4096]
             xb, yb = x_train[idx], y_train[idx]
             tb = temp_train[idx] if use_temp_embed else None
@@ -347,7 +348,7 @@ def finetune(
                 raise ValueError("phys_lambda>0 时必须提供 cyc_key_train")
             model.train()
             preds: list[torch.Tensor] = []
-            for start in range(0, n, 4096):
+            for start in range(0, n, batch_size):
                 xb = x_train[start : start + 4096]
                 tb = temp_train[start : start + 4096] if use_temp_embed else None
                 preds.append(model.soh_predict(xb, tb))
@@ -536,6 +537,8 @@ def main() -> None:
                         help="物理约束权重（0 = 关闭；0.1 = 与车辆微调一致）")
     parser.add_argument("--save-preds", type=Path, default=None,
                         help="保存测试集逐片段预测 parquet 的路径")
+    parser.add_argument("--batch-size", type=int, default=4096,
+                        help="训练/物理损失批大小（从头训练需调小避免显存不足）")
     args = parser.parse_args()
 
     if args.freeze_encoder and args.unfreeze_encoder:
@@ -633,6 +636,7 @@ def main() -> None:
             cyc_key_train=cyc_key_train,
             use_temp_embed=args.use_temp_embed,
             phys_lambda=args.phys_lambda,
+            batch_size=args.batch_size,
         )
     else:
         print("epochs=0：跳过微调，直接评估预训练模型（零样本对照）")
