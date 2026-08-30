@@ -47,6 +47,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from scipy.signal import savgol_filter
 
 ROOT = Path(__file__).resolve().parents[3]
 TR_DIR = Path(__file__).resolve().parent
@@ -60,6 +61,7 @@ from dvdq_features import (  # noqa: E402
     DVDQ_MOMENT_CENTER,
     DVDQ_MOMENT_SCALE,
     N_DVDQ_MOMENTS,
+    SOC_STEP,
     compute_dvdq_moments,
 )
 from model import TemperatureSohLSTM  # noqa: E402
@@ -99,6 +101,19 @@ DEFAULT_MIN_SOH = 0.75
 BUCKET_EDGES = (0.75, 0.80, 0.85, 0.90, 0.95, 1.001)
 
 
+def _dvdq_channel_from_segment(seg: dict[str, np.ndarray]) -> np.ndarray:
+    """从插值片段计算第 4 物理通道 tanh(dV/dQ)。
+
+    等容量网格步长均匀（0.002 SOC），S-G deriv=1 直接输出解析导数；
+    tanh 软压缩到 [-1, 1]，防止充电起止端极化剧烈时导数爆炸。
+    """
+    dvdq = savgol_filter(
+        seg["V"], window_length=21, polyorder=3,
+        deriv=1, delta=SOC_STEP, axis=-1,
+    )
+    return np.tanh(dvdq).astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # SIT 片段构建（电池级，预加载到内存）
 # ---------------------------------------------------------------------------
@@ -111,11 +126,15 @@ def _charge_capacity_series(cell_id: str, data_dir: Path) -> np.ndarray:
 
 
 def build_cell_samples_full(
-    cell_id: str, data_dir: Path
+    cell_id: str,
+    data_dir: Path,
+    dvdq_channel: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """构建一只 SIT 电池的全部片段样本，返回 (x, soh, temp_features, cycle_ids)。
 
     x             : (N, 101, 3) float32，归一化 [I(C-rate), V, Q(SOC)]；
+                    dvdq_channel=True 时为 (N, 101, 4)，
+                    追加第 4 通道 tanh(dV/dQ)（S-G deriv=1，等容量网格）；
     soh           : (N,) float32，标签 = Qc(k) / Qc_max；
     temp_features : (N, 12) float32，温度曲线形状特征（temp_features.py）；
     cycle_ids     : (N,) int64，每片段所属循环号（物理约束按循环聚合需要）。
@@ -156,14 +175,14 @@ def build_cell_samples_full(
                 end_ah=float(row.end_ah),
                 nominal_capacity=SIT_NOMINAL_CAPACITY_AH,
             )
-            x = np.stack(
-                [
-                    seg["I"] / SIT_NOMINAL_CAPACITY_AH,   # C-rate
-                    seg["V"],                              # V
-                    seg["capacity"] / SIT_NOMINAL_CAPACITY_AH,  # SOC
-                ],
-                axis=1,
-            ).astype(np.float32)
+            channels = [
+                seg["I"] / SIT_NOMINAL_CAPACITY_AH,   # C-rate
+                seg["V"],                              # V
+                seg["capacity"] / SIT_NOMINAL_CAPACITY_AH,  # SOC
+            ]
+            if dvdq_channel:
+                channels.append(_dvdq_channel_from_segment(seg))
+            x = np.stack(channels, axis=1).astype(np.float32)
             temp_feat = extract_temp_shape_features(
                 seg,
                 nominal_capacity=SIT_NOMINAL_CAPACITY_AH,
@@ -248,7 +267,10 @@ def get_cell_samples(
 
 
 def get_cell_samples_full(
-    cell_id: str, data_dir: Path, cache_dir: Path | None
+    cell_id: str,
+    data_dir: Path,
+    cache_dir: Path | None,
+    dvdq_channel: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """完整版：优先扩展缓存，否则回退 xlsx 构建（较慢）。"""
     if cache_dir is not None:
@@ -256,7 +278,7 @@ def get_cell_samples_full(
             return load_cell_from_cache_full(cell_id, cache_dir)
         except (FileNotFoundError, KeyError) as exc:
             print(f"  [提示] {cell_id} 扩展缓存不可用（{exc}），回退 xlsx", flush=True)
-    return build_cell_samples_full(cell_id, data_dir)
+    return build_cell_samples_full(cell_id, data_dir, dvdq_channel=dvdq_channel)
 
 
 def filter_by_soh(
@@ -579,6 +601,7 @@ def evaluate(
     use_temp_embed: bool = False,
     relative_only: bool = False,
     dvdq_moments: bool = False,
+    dvdq_channel: bool = False,
     save_preds_path: Path | None = None,
 ) -> dict[str, dict]:
     """在指定电池上评估，返回每只电池 + 汇总统计。
@@ -600,8 +623,10 @@ def evaluate(
     temp_of = dict(zip(cells["cell_id"], cells["temp_group"]))
 
     for cell_id in cell_ids:
-        if use_temp_embed or save_preds_path is not None:
-            x, y, temp, cyc = get_cell_samples_full(cell_id, data_dir, cache_dir)
+        if use_temp_embed or save_preds_path is not None or dvdq_channel:
+            x, y, temp, cyc = get_cell_samples_full(
+                cell_id, data_dir, cache_dir, dvdq_channel=dvdq_channel
+            )
             x, y, temp, cyc = filter_by_soh_full(x, y, temp, cyc, min_soh)
             if relative_only:
                 temp = neutralize_absolute_features(temp)
@@ -750,6 +775,11 @@ def main() -> None:
                              "均值/方差/偏度（3 维），拼到温度形状特征后一起"
                              "送入条件调制特征层。需配合 --use-temp-embed。"
                              "对应导师建议的'相变峰'预处理（S-G deriv=1）")
+    parser.add_argument("--dvdq-channel", action="store_true",
+                        help="第 4 物理通道 = tanh(dV/dQ)（与 I,V,Q 并列送入"
+                             "编码器）。需配合 4 通道缓存（sit_cache_dvdq）与"
+                             "4 通道预训练模型（--pretrained 指向 dvdq4ch 产物）。"
+                             "导师最终方案：让 LSTM 在时间步展开中学习导数流动")
     parser.add_argument("--discard-head", action="store_true",
                         help="预训练初始化时丢弃 SOH 头（随机头诊断实验用："
                              "隔离'温度特征'与'SOH头初始化'两个因素）")
@@ -788,6 +818,7 @@ def main() -> None:
         freeze = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    input_dim = 4 if args.dvdq_channel else 3
     # 条件特征维度：12 维温度形状特征，可选追加 3 维 dV/dQ 矩。
     feature_dim = N_FEATURES
     feature_center: tuple[float, ...] = FEATURE_CENTER
@@ -797,7 +828,7 @@ def main() -> None:
         feature_center = tuple(FEATURE_CENTER) + DVDQ_MOMENT_CENTER
         feature_scale = tuple(FEATURE_SCALE) + DVDQ_MOMENT_SCALE
     model = TemperatureSohLSTM(
-        input_dim=3,
+        input_dim=input_dim,
         use_temp_embed=args.use_temp_embed,
         temp_mode=args.temp_mode,
         temp_range=(0.0, 55.0),
@@ -826,6 +857,14 @@ def main() -> None:
                   f"(丢弃 SOH 头[{reason}]，missing={len(missing)})")
         else:
             missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+            embed_missing = [k for k in missing if k.startswith("embed")]
+            if embed_missing:
+                raise ValueError(
+                    "预训练模型输入通道与当前配置不匹配（embed 层权重缺失: "
+                    f"{embed_missing}）。--dvdq-channel 需要 4 通道预训练模型"
+                    "（models/temperature_soh/dvdq4ch/），普通 3 通道模型请"
+                    "不要加 --dvdq-channel。"
+                )
             print(f"初始化: 预训练权重 {args.pretrained} "
                   f"(温度模块新参数随机初始化，missing={len(missing)})")
     else:
@@ -833,7 +872,8 @@ def main() -> None:
     model.to(device)
     print(f"设备: {device}  温度嵌入: {args.use_temp_embed}  "
           f"方式: {args.temp_mode}  相对特征: {args.relative_only}  "
-          f"dV/dQ矩: {args.dvdq_moments}  物理约束λ: {args.phys_lambda}")
+          f"dV/dQ矩: {args.dvdq_moments}  dV/dQ通道: {args.dvdq_channel}  "
+          f"物理约束λ: {args.phys_lambda}")
 
     train_cells = [c.strip() for c in args.train_cells.split(",") if c.strip()]
     all_cells = discover_sit_cells(args.data_dir)["cell_id"].tolist()
@@ -855,9 +895,15 @@ def main() -> None:
         xs, ys = [], []
         temps, cyc_keys = [], []
         for cell_id in train_cells:
-            if args.use_temp_embed or args.phys_lambda > 0 or args.contrastive_lambda > 0:
+            if (
+                args.use_temp_embed
+                or args.phys_lambda > 0
+                or args.contrastive_lambda > 0
+                or args.dvdq_channel
+            ):
                 x, y, temp, cyc = get_cell_samples_full(
-                    cell_id, args.data_dir, args.cache_dir
+                    cell_id, args.data_dir, args.cache_dir,
+                    dvdq_channel=args.dvdq_channel,
                 )
                 x, y, temp, cyc = filter_by_soh_full(
                     x, y, temp, cyc, args.min_soh
@@ -916,6 +962,7 @@ def main() -> None:
         use_temp_embed=args.use_temp_embed,
         relative_only=args.relative_only,
         dvdq_moments=args.dvdq_moments,
+        dvdq_channel=args.dvdq_channel,
         save_preds_path=args.save_preds,
     )
     _print_report(rows)
