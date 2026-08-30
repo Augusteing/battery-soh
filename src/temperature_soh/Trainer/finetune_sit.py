@@ -76,6 +76,7 @@ from temp_features import (  # noqa: E402
     FEATURE_CENTER,
     FEATURE_SCALE,
     extract_temp_shape_features,
+    neutralize_absolute_features,
 )
 
 DEFAULT_PRETRAINED = ROOT / "models" / "temperature_soh" / "normalized_3ch.pt"
@@ -399,11 +400,14 @@ def evaluate(
     cache_dir: Path | None = None,
     min_soh: float | None = DEFAULT_MIN_SOH,
     use_temp_embed: bool = False,
+    relative_only: bool = False,
     save_preds_path: Path | None = None,
 ) -> dict[str, dict]:
     """在指定电池上评估，返回每只电池 + 汇总统计。
 
     use_temp_embed=True 时加载温度形状特征并传给模型；
+    relative_only=True 时把绝对温度水平维（T_mean/T_start/T_end/T_max/T_min）
+        抹成固定中性值（诊断"绝对温度 = 电池身份捷径"的消融实验）；
     save_preds_path 不为空时，额外保存逐片段预测 parquet
     （cell_id, cycle_index, soh_true, soh_pred），供 5.3 图表使用。
     """
@@ -420,6 +424,8 @@ def evaluate(
         if use_temp_embed or save_preds_path is not None:
             x, y, temp, cyc = get_cell_samples_full(cell_id, data_dir, cache_dir)
             x, y, temp, cyc = filter_by_soh_full(x, y, temp, cyc, min_soh)
+            if relative_only:
+                temp = neutralize_absolute_features(temp)
         else:
             x, y = get_cell_samples(cell_id, data_dir, cache_dir)
             x, y = filter_by_soh(x, y, min_soh)
@@ -547,6 +553,10 @@ def main() -> None:
                         help="全量低学习率微调（编码器 lr = 头的 1/10）")
     parser.add_argument("--use-temp-embed", action="store_true",
                         help="启用温度形状特征嵌入（12 维特征，EDD+FFN）")
+    parser.add_argument("--relative-only", action="store_true",
+                        help="温度消融：把绝对温度水平维（T_mean/T_start/T_end/"
+                             "T_max/T_min）抹成固定中性值，只保留相对形状特征"
+                             "（温差、温升率、位置）。需配合 --use-temp-embed")
     parser.add_argument("--discard-head", action="store_true",
                         help="预训练初始化时丢弃 SOH 头（随机头诊断实验用："
                              "隔离'温度特征'与'SOH头初始化'两个因素）")
@@ -560,6 +570,9 @@ def main() -> None:
 
     if args.freeze_encoder and args.unfreeze_encoder:
         raise ValueError("--freeze-encoder 与 --unfreeze-encoder 互斥")
+    if args.relative_only and not args.use_temp_embed:
+        raise ValueError("--relative-only 是温度嵌入的消融，必须配合 "
+                         "--use-temp-embed 使用")
     freeze = args.freeze_encoder or not args.unfreeze_encoder  # 默认冻结
     if args.init == "random" and freeze:
         print("提示: 随机初始化不能冻结编码器，自动切换为全量训练")
@@ -623,6 +636,8 @@ def main() -> None:
                 x, y, temp, cyc = filter_by_soh_full(
                     x, y, temp, cyc, args.min_soh
                 )
+                if args.relative_only:
+                    temp = neutralize_absolute_features(temp)
                 temps.append(temp)
                 # 复合循环键：电池序号 * 1e6 + 循环号，避免跨电池循环号冲突。
                 cyc_keys.append(
@@ -664,6 +679,7 @@ def main() -> None:
         model, test_cells, args.data_dir, device, args.cache_dir,
         min_soh=args.min_soh,
         use_temp_embed=args.use_temp_embed,
+        relative_only=args.relative_only,
         save_preds_path=args.save_preds,
     )
     _print_report(rows)

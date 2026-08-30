@@ -97,6 +97,35 @@ FEATURE_SCALE = (
 
 N_FEATURES = len(FEATURE_NAMES)
 
+# 绝对温度水平类特征的索引（0~4）：T_mean / T_start / T_end / T_max / T_min。
+# 诊断实验用：把这几维抹成固定中性值后，模型只能看到"相对形状"
+# （温差、温升率、峰值位置），从而检验"绝对温度水平 = 电池身份捷径"
+# 这一假设（恒温箱≈40°C、环境温 25~58°C，绝对水平与电池分组强相关）。
+ABSOLUTE_FEATURE_IDX = (0, 1, 2, 3, 4)
+
+
+def neutralize_absolute_features(
+    temp: np.ndarray, neutral_c: float | None = None
+) -> np.ndarray:
+    """把绝对温度水平维（0~4）替换成固定中性值，返回新数组（不改原数据）。
+
+    参数
+    ----
+    temp       : (..., 12) 温度形状特征（物理单位）。
+    neutral_c  : 中性温度值（°C）。默认取 FEATURE_CENTER[0] = 25.0，
+                 这样模型里标准化后恰好为 0，EDD 档位对所有样本相同，
+                 绝对水平通道不再携带任何样本间信息。
+
+    返回
+    ----
+    拷贝后的 (..., 12) 数组：0~4 维为常数，5~11 维保持原值。
+    """
+    out = np.array(temp, dtype=np.float32, copy=True)
+    if neutral_c is None:
+        neutral_c = FEATURE_CENTER[0]
+    out[..., ABSOLUTE_FEATURE_IDX] = float(neutral_c)
+    return out
+
 
 def extract_temp_shape_features(
     seg: dict[str, np.ndarray],

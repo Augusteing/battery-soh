@@ -45,24 +45,27 @@ A_TRAIN = ["001-6","001-7","001-1","001-8","001-4","001-3","001-5",
            "002-5","003-5","002-3","003-1","002-7","003-7","003-3"]
 A_TEST  = ["101-3","001-2","101-1","002-4","002-1","002-2"]
 
-# (名称, 训练电池, 测试电池, init, 温度嵌入, 物理λ, epochs)
-CONFIGS: list[tuple[str, list[str], list[str], str, bool, float, int]] = [
-    ("A-trans",      A_TRAIN, A_TEST, "pretrained", True,  0.1, 30),
-    ("A-trans-nt",   A_TRAIN, A_TEST, "pretrained", False, 0.1, 30),
-    ("A-scratch",    A_TRAIN, A_TEST, "random",     True,  0.1, 30),
-    ("B1-trans",     AMBIENT, CHAMBER, "pretrained", True,  0.1, 30),
-    ("B1-trans-nt",  AMBIENT, CHAMBER, "pretrained", False, 0.1, 30),
-    ("B1-scratch",   AMBIENT, CHAMBER, "random",     True,  0.1, 30),
-    ("B2-trans",     CHAMBER, AMBIENT, "pretrained", True,  0.1, 30),
-    ("B2-trans-nt",  CHAMBER, AMBIENT, "pretrained", False, 0.1, 30),
-    ("B2-scratch",   CHAMBER, AMBIENT, "random",     True,  0.1, 30),
+# (名称, 训练电池, 测试电池, init, 温度嵌入, 物理λ, epochs, 相对特征消融)
+CONFIGS: list[tuple[str, list[str], list[str], str, bool, float, int, bool]] = [
+    ("A-trans",       A_TRAIN, A_TEST, "pretrained", True,  0.1, 30, False),
+    ("A-trans-nt",    A_TRAIN, A_TEST, "pretrained", False, 0.1, 30, False),
+    ("A-scratch",     A_TRAIN, A_TEST, "random",     True,  0.1, 30, False),
+    ("B1-trans",      AMBIENT, CHAMBER, "pretrained", True,  0.1, 30, False),
+    # 诊断消融：B1 带温度，但只保留相对形状特征（抹掉绝对温度水平），
+    # 用于检验"绝对温度 = 电池身份捷径"（B1-trans 9.76% vs trans-nt 5.54%）。
+    ("B1-trans-rel",  AMBIENT, CHAMBER, "pretrained", True,  0.1, 30, True),
+    ("B1-trans-nt",   AMBIENT, CHAMBER, "pretrained", False, 0.1, 30, False),
+    ("B1-scratch",    AMBIENT, CHAMBER, "random",     True,  0.1, 30, False),
+    ("B2-trans",      CHAMBER, AMBIENT, "pretrained", True,  0.1, 30, False),
+    ("B2-trans-nt",   CHAMBER, AMBIENT, "pretrained", False, 0.1, 30, False),
+    ("B2-scratch",    CHAMBER, AMBIENT, "random",     True,  0.1, 30, False),
     # 零样本全量：一次测评全部 20 只，各视角按测试电池过滤。
-    ("zero-all",     [],      AMBIENT + CHAMBER, "pretrained", False, 0.0, 0),
+    ("zero-all",      [],      AMBIENT + CHAMBER, "pretrained", False, 0.0, 0, False),
 ]
 
 
 def run_one(name: str, train: list[str], test: list[str], init: str,
-            use_temp: bool, phys: float, epochs: int) -> int:
+            use_temp: bool, phys: float, epochs: int, relative_only: bool) -> int:
     """跑一个配置，日志落盘，返回子进程退出码。"""
     cmd = [
         PYTHON, str(SCRIPT),
@@ -77,6 +80,8 @@ def run_one(name: str, train: list[str], test: list[str], init: str,
     ]
     if use_temp:
         cmd.append("--use-temp-embed")
+    if relative_only:
+        cmd.append("--relative-only")
     if phys > 0:
         cmd += ["--phys-lambda", str(phys)]
     # 从头训练（init=random）要训练编码器，LSTM 反向图大，
@@ -99,6 +104,14 @@ def run_one(name: str, train: list[str], test: list[str], init: str,
 
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--only", default=None,
+                        help="只跑指定配置（逗号分隔），默认全部")
+    args = parser.parse_args()
+    only = {s.strip() for s in args.only.split(",")} if args.only else None
+
     if not (CACHE_DIR / "temp_features.npy").exists():
         raise SystemExit(
             f"缓存缺少 temp_features.npy，请先运行 "
@@ -106,6 +119,8 @@ def main() -> None:
         )
     failed = []
     for cfg in CONFIGS:
+        if only is not None and cfg[0] not in only:
+            continue
         code = run_one(*cfg)
         if code != 0:
             failed.append(cfg[0])
