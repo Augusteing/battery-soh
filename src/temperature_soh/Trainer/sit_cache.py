@@ -10,6 +10,8 @@ SIT 数据是逐个 xlsx 存储的（20 只电池 × 约 700 循环 × 2 sheet�
   X.npy            float32 (N, 101, 3)  归一化输入 [I(C-rate), V, Q(SOC)]
   y.npy            float32 (N,)         SOH = Qc / Qc_max
   cell_ids.npy     str (N,)             每行所属电池
+  temp_features.npy float32 (N, 12)     温度曲线形状特征（温度模块用）
+  cycle_ids.npy    int64 (N,)           每行所属循环号（物理约束用）
   meta.json        每电池样本数、总样本数
 
 用法：
@@ -39,7 +41,7 @@ for d in (TR_DIR, DL_DIR):
     if str(d) not in sys.path:
         sys.path.insert(0, str(d))
 
-from finetune_sit import build_cell_samples  # noqa: E402
+from finetune_sit import build_cell_samples_full  # noqa: E402
 from sit_io import DEFAULT_SIT_DIR, discover_sit_cells  # noqa: E402
 
 DEFAULT_CACHE_DIR = ROOT / "data" / "processed" / "sit_cache"
@@ -49,8 +51,12 @@ def build_cache(
     cell_ids: list[str],
     data_dir: Path,
     cache_dir: Path,
+    rebuild: bool = False,
 ) -> None:
-    """为指定电池构建片段缓存（追加模式：已存在的电池跳过）。"""
+    """为指定电池构建片段缓存（追加模式：已存在的电池跳过）。
+
+    rebuild=True 时忽略已有缓存，从空数组开始重建全部（用于缓存格式升级）。
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # 已有缓存信息
@@ -59,6 +65,8 @@ def build_cache(
     if meta_path.exists():
         existing = json.loads(meta_path.read_text(encoding="utf-8"))
     done = set(existing.get("cells", []))
+    if rebuild:
+        done = set()
     todo = [c for c in cell_ids if c not in done]
     if not todo:
         print("所有指定电池已在缓存中，跳过")
@@ -68,19 +76,47 @@ def build_cache(
     x_path = cache_dir / "X.npy"
     y_path = cache_dir / "y.npy"
     cell_path = cache_dir / "cell_ids.npy"
-    x_all = np.load(x_path) if x_path.exists() else np.zeros((0, 101, 3), np.float32)
-    y_all = np.load(y_path) if y_path.exists() else np.zeros((0,), np.float32)
-    cell_all = (
-        np.load(cell_path, allow_pickle=True) if cell_path.exists()
-        else np.zeros((0,), dtype=object)
-    )
+    temp_path = cache_dir / "temp_features.npy"
+    cyc_path = cache_dir / "cycle_ids.npy"
+    if rebuild:
+        x_all = np.zeros((0, 101, 3), np.float32)
+        y_all = np.zeros((0,), np.float32)
+        cell_all = np.zeros((0,), dtype=object)
+        temp_all = np.zeros((0, 12), np.float32)
+        cyc_all = np.zeros((0,), np.int64)
+        # 直接覆盖旧文件，避免旧格式残留。
+        np.save(x_path, x_all)
+        np.save(y_path, y_all)
+        np.save(cell_path, cell_all)
+        np.save(temp_path, temp_all)
+        np.save(cyc_path, cyc_all)
+        meta_path.write_text(
+            json.dumps({"cells": [], "n": 0}, ensure_ascii=False), encoding="utf-8"
+        )
+        print("[sit_cache] 重建模式：清空旧缓存", flush=True)
+    else:
+        x_all = np.load(x_path) if x_path.exists() else np.zeros((0, 101, 3), np.float32)
+        y_all = np.load(y_path) if y_path.exists() else np.zeros((0,), np.float32)
+        cell_all = (
+            np.load(cell_path, allow_pickle=True) if cell_path.exists()
+            else np.zeros((0,), dtype=object)
+        )
+        temp_all = (
+            np.load(temp_path) if temp_path.exists()
+            else np.zeros((0, 12), np.float32)
+        )
+        cyc_all = (
+            np.load(cyc_path) if cyc_path.exists() else np.zeros((0,), np.int64)
+        )
 
     t0 = time.perf_counter()
     for cell_id in todo:
         try:
-            x, y = build_cell_samples(cell_id, data_dir)
+            x, y, temp, cyc = build_cell_samples_full(cell_id, data_dir)
             x_all = np.concatenate([x_all, x], axis=0)
             y_all = np.concatenate([y_all, y], axis=0)
+            temp_all = np.concatenate([temp_all, temp], axis=0)
+            cyc_all = np.concatenate([cyc_all, cyc], axis=0)
             cell_all = np.concatenate(
                 [cell_all, np.full(len(x), cell_id, dtype=object)], axis=0
             )
@@ -89,10 +125,13 @@ def build_cache(
             np.save(x_path, x_all)
             np.save(y_path, y_all)
             np.save(cell_path, cell_all)
+            np.save(temp_path, temp_all)
+            np.save(cyc_path, cyc_all)
             meta = {
                 "cells": sorted(done),
                 "n": int(len(y_all)),
                 "shape_x": [int(x_all.shape[0]), 101, 3],
+                "shape_temp": [int(temp_all.shape[0]), 12],
             }
             meta_path.write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -117,6 +156,8 @@ def main() -> None:
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--cells", default=None,
                         help="只构建指定电池（逗号分隔）；默认全部 20 只")
+    parser.add_argument("--rebuild", action="store_true",
+                        help="忽略已有缓存，全量重建（缓存格式升级时用）")
     args = parser.parse_args()
 
     all_cells = discover_sit_cells(args.data_dir)["cell_id"].tolist()
@@ -128,7 +169,7 @@ def main() -> None:
     if missing:
         raise ValueError(f"未知电池: {missing}")
     print(f"构建 {len(cells)} 只电池的缓存 ...")
-    build_cache(cells, args.data_dir, args.cache_dir)
+    build_cache(cells, args.data_dir, args.cache_dir, rebuild=args.rebuild)
 
 
 if __name__ == "__main__":
