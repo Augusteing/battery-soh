@@ -54,6 +54,10 @@ CONFIGS: list[tuple[str, list[str], list[str], str, bool, str, float, int, bool,
     # 用于检验"同分布场景下逆频率加权是否对症"（B1 跨温度场景净效应为负）。
     ("A-film-rel",    A_TRAIN, A_TEST, "pretrained", True,  "film", 0.1, 30, True,  False, 0.0, False, False),
     ("A-film-rel-bw", A_TRAIN, A_TEST, "pretrained", True,  "film", 0.1, 30, True,  True,  0.0, False, False),
+    # A 组 dV/dQ 矩特征对照：与 A-film-rel 唯一区别是特征向量追加
+    # tanh(dV/dQ) 三阶矩。用于检验"矩特征在同分布（无跨温度捷径）
+    # 场景下是否有增量"（B1 跨温度结果为负：5.02% -> 5.65%）。
+    ("A-film-rel-dvdq", A_TRAIN, A_TEST, "pretrained", True, "film", 0.1, 30, True, False, 0.0, False, True),
     ("B1-trans",      AMBIENT, CHAMBER, "pretrained", True,  "concat", 0.1, 30, False, False, 0.0, False, False),
     # 诊断消融：B1 带温度，但只保留相对形状特征（抹掉绝对温度水平），
     # 用于检验"绝对温度 = 电池身份捷径"（B1-trans 9.76% vs trans-nt 5.54%）。
