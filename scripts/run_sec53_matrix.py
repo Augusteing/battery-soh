@@ -50,6 +50,10 @@ CONFIGS: list[tuple[str, list[str], list[str], str, bool, str, float, int, bool,
     ("A-trans",       A_TRAIN, A_TEST, "pretrained", True,  "concat", 0.1, 30, False, False),
     ("A-trans-nt",    A_TRAIN, A_TEST, "pretrained", False, "concat", 0.1, 30, False, False),
     ("A-scratch",     A_TRAIN, A_TEST, "random",     True,  "concat", 0.1, 30, False, False),
+    # A 组条件调制对照：FiLM + 相对特征（不加权基线），及其分桶加权版。
+    # 用于检验"同分布场景下逆频率加权是否对症"（B1 跨温度场景净效应为负）。
+    ("A-film-rel",    A_TRAIN, A_TEST, "pretrained", True,  "film", 0.1, 30, True,  False),
+    ("A-film-rel-bw", A_TRAIN, A_TEST, "pretrained", True,  "film", 0.1, 30, True,  True),
     ("B1-trans",      AMBIENT, CHAMBER, "pretrained", True,  "concat", 0.1, 30, False, False),
     # 诊断消融：B1 带温度，但只保留相对形状特征（抹掉绝对温度水平），
     # 用于检验"绝对温度 = 电池身份捷径"（B1-trans 9.76% vs trans-nt 5.54%）。
