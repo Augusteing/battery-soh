@@ -56,6 +56,12 @@ for d in (TR_DIR, DL_DIR):
         sys.path.insert(0, str(d))
 
 from dataset import TEMP_CENTER_C, TEMP_SCALE_C  # noqa: E402
+from dvdq_features import (  # noqa: E402
+    DVDQ_MOMENT_CENTER,
+    DVDQ_MOMENT_SCALE,
+    N_DVDQ_MOMENTS,
+    compute_dvdq_moments,
+)
 from model import TemperatureSohLSTM  # noqa: E402
 from physics_loss import cycle_physics_losses  # noqa: E402
 from segments import (  # noqa: E402
@@ -76,6 +82,7 @@ from sit_io import (  # noqa: E402
 from temp_features import (  # noqa: E402
     FEATURE_CENTER,
     FEATURE_SCALE,
+    N_FEATURES,
     extract_temp_shape_features,
     neutralize_absolute_features,
 )
@@ -571,6 +578,7 @@ def evaluate(
     min_soh: float | None = DEFAULT_MIN_SOH,
     use_temp_embed: bool = False,
     relative_only: bool = False,
+    dvdq_moments: bool = False,
     save_preds_path: Path | None = None,
 ) -> dict[str, dict]:
     """在指定电池上评估，返回每只电池 + 汇总统计。
@@ -578,6 +586,7 @@ def evaluate(
     use_temp_embed=True 时加载温度形状特征并传给模型；
     relative_only=True 时把绝对温度水平维（T_mean/T_start/T_end/T_max/T_min）
         抹成固定中性值（诊断"绝对温度 = 电池身份捷径"的消融实验）；
+    dvdq_moments=True 时把 tanh(dV/dQ) 的均值/方差/偏度拼到特征向量尾部；
     save_preds_path 不为空时，额外保存逐片段预测 parquet
     （cell_id, cycle_index, soh_true, soh_pred），供 5.3 图表使用。
     """
@@ -596,6 +605,11 @@ def evaluate(
             x, y, temp, cyc = filter_by_soh_full(x, y, temp, cyc, min_soh)
             if relative_only:
                 temp = neutralize_absolute_features(temp)
+            if dvdq_moments:
+                moments = compute_dvdq_moments(
+                    x[:, :, 1], x[:, :, 2]  # V、Q(SOC) 通道
+                )
+                temp = np.concatenate([temp, moments], axis=-1)
         else:
             x, y = get_cell_samples(cell_id, data_dir, cache_dir)
             x, y = filter_by_soh(x, y, min_soh)
@@ -731,6 +745,11 @@ def main() -> None:
                         help="温度消融：把绝对温度水平维（T_mean/T_start/T_end/"
                              "T_max/T_min）抹成固定中性值，只保留相对形状特征"
                              "（温差、温升率、位置）。需配合 --use-temp-embed")
+    parser.add_argument("--dvdq-moments", action="store_true",
+                        help="启用 dV/dQ 矩特征：对片段窗口内 tanh(dV/dQ) 计算"
+                             "均值/方差/偏度（3 维），拼到温度形状特征后一起"
+                             "送入条件调制特征层。需配合 --use-temp-embed。"
+                             "对应导师建议的'相变峰'预处理（S-G deriv=1）")
     parser.add_argument("--discard-head", action="store_true",
                         help="预训练初始化时丢弃 SOH 头（随机头诊断实验用："
                              "隔离'温度特征'与'SOH头初始化'两个因素）")
@@ -760,19 +779,31 @@ def main() -> None:
     if args.relative_only and not args.use_temp_embed:
         raise ValueError("--relative-only 是温度嵌入的消融，必须配合 "
                          "--use-temp-embed 使用")
+    if args.dvdq_moments and not args.use_temp_embed:
+        raise ValueError("--dvdq-moments 需要启用 --use-temp-embed"
+                         "（矩特征经 FiLM/特征层注入）")
     freeze = args.freeze_encoder or not args.unfreeze_encoder  # 默认冻结
     if args.init == "random" and freeze:
         print("提示: 随机初始化不能冻结编码器，自动切换为全量训练")
         freeze = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 条件特征维度：12 维温度形状特征，可选追加 3 维 dV/dQ 矩。
+    feature_dim = N_FEATURES
+    feature_center: tuple[float, ...] = FEATURE_CENTER
+    feature_scale: tuple[float, ...] = FEATURE_SCALE
+    if args.dvdq_moments:
+        feature_dim += N_DVDQ_MOMENTS
+        feature_center = tuple(FEATURE_CENTER) + DVDQ_MOMENT_CENTER
+        feature_scale = tuple(FEATURE_SCALE) + DVDQ_MOMENT_SCALE
     model = TemperatureSohLSTM(
         input_dim=3,
         use_temp_embed=args.use_temp_embed,
         temp_mode=args.temp_mode,
         temp_range=(0.0, 55.0),
-        temp_feature_center=FEATURE_CENTER,
-        temp_feature_scale=FEATURE_SCALE,
+        temp_feature_dim=feature_dim,
+        temp_feature_center=feature_center,
+        temp_feature_scale=feature_scale,
     )
     if args.init == "pretrained":
         if not args.pretrained.exists():
@@ -802,7 +833,7 @@ def main() -> None:
     model.to(device)
     print(f"设备: {device}  温度嵌入: {args.use_temp_embed}  "
           f"方式: {args.temp_mode}  相对特征: {args.relative_only}  "
-          f"物理约束λ: {args.phys_lambda}")
+          f"dV/dQ矩: {args.dvdq_moments}  物理约束λ: {args.phys_lambda}")
 
     train_cells = [c.strip() for c in args.train_cells.split(",") if c.strip()]
     all_cells = discover_sit_cells(args.data_dir)["cell_id"].tolist()
@@ -833,6 +864,11 @@ def main() -> None:
                 )
                 if args.relative_only:
                     temp = neutralize_absolute_features(temp)
+                if args.dvdq_moments:
+                    moments = compute_dvdq_moments(
+                        x[:, :, 1], x[:, :, 2]  # V、Q(SOC) 通道
+                    )
+                    temp = np.concatenate([temp, moments], axis=-1)
                 temps.append(temp)
                 # 复合循环键：电池序号 * 1e6 + 循环号，避免跨电池循环号冲突。
                 cyc_keys.append(
@@ -879,6 +915,7 @@ def main() -> None:
         min_soh=args.min_soh,
         use_temp_embed=args.use_temp_embed,
         relative_only=args.relative_only,
+        dvdq_moments=args.dvdq_moments,
         save_preds_path=args.save_preds,
     )
     _print_report(rows)

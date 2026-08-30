@@ -45,43 +45,47 @@ A_TRAIN = ["001-6","001-7","001-1","001-8","001-4","001-3","001-5",
            "002-5","003-5","002-3","003-1","002-7","003-7","003-3"]
 A_TEST  = ["101-3","001-2","101-1","002-4","002-1","002-2"]
 
-# (名称, 训练, 测试, init, 温度, 方式, 物理λ, epochs, 相对, 分桶, 对比λ, 解冻)
-CONFIGS: list[tuple[str, list[str], list[str], str, bool, str, float, int, bool, bool, float, bool]] = [
-    ("A-trans",       A_TRAIN, A_TEST, "pretrained", True,  "concat", 0.1, 30, False, False, 0.0, False),
-    ("A-trans-nt",    A_TRAIN, A_TEST, "pretrained", False, "concat", 0.1, 30, False, False, 0.0, False),
-    ("A-scratch",     A_TRAIN, A_TEST, "random",     True,  "concat", 0.1, 30, False, False, 0.0, False),
+# (名称, 训练, 测试, init, 温度, 方式, 物理λ, epochs, 相对, 分桶, 对比λ, 解冻, dV/dQ矩)
+CONFIGS: list[tuple[str, list[str], list[str], str, bool, str, float, int, bool, bool, float, bool, bool]] = [
+    ("A-trans",       A_TRAIN, A_TEST, "pretrained", True,  "concat", 0.1, 30, False, False, 0.0, False, False),
+    ("A-trans-nt",    A_TRAIN, A_TEST, "pretrained", False, "concat", 0.1, 30, False, False, 0.0, False, False),
+    ("A-scratch",     A_TRAIN, A_TEST, "random",     True,  "concat", 0.1, 30, False, False, 0.0, False, False),
     # A 组条件调制对照：FiLM + 相对特征（不加权基线），及其分桶加权版。
     # 用于检验"同分布场景下逆频率加权是否对症"（B1 跨温度场景净效应为负）。
-    ("A-film-rel",    A_TRAIN, A_TEST, "pretrained", True,  "film", 0.1, 30, True,  False, 0.0, False),
-    ("A-film-rel-bw", A_TRAIN, A_TEST, "pretrained", True,  "film", 0.1, 30, True,  True,  0.0, False),
-    ("B1-trans",      AMBIENT, CHAMBER, "pretrained", True,  "concat", 0.1, 30, False, False, 0.0, False),
+    ("A-film-rel",    A_TRAIN, A_TEST, "pretrained", True,  "film", 0.1, 30, True,  False, 0.0, False, False),
+    ("A-film-rel-bw", A_TRAIN, A_TEST, "pretrained", True,  "film", 0.1, 30, True,  True,  0.0, False, False),
+    ("B1-trans",      AMBIENT, CHAMBER, "pretrained", True,  "concat", 0.1, 30, False, False, 0.0, False, False),
     # 诊断消融：B1 带温度，但只保留相对形状特征（抹掉绝对温度水平），
     # 用于检验"绝对温度 = 电池身份捷径"（B1-trans 9.76% vs trans-nt 5.54%）。
-    ("B1-trans-rel",  AMBIENT, CHAMBER, "pretrained", True,  "concat", 0.1, 30, True,  False, 0.0, False),
+    ("B1-trans-rel",  AMBIENT, CHAMBER, "pretrained", True,  "concat", 0.1, 30, True,  False, 0.0, False, False),
     # 条件调制版：FiLM（温度生成 γ、β 调制表征）+ 相对特征消融。
     # 预期：抑制"绝对温度 = 身份"捷径，同时保留温度的调节能力。
-    ("B1-film-rel",   AMBIENT, CHAMBER, "pretrained", True,  "film", 0.1, 30, True,  False, 0.0, False),
+    ("B1-film-rel",   AMBIENT, CHAMBER, "pretrained", True,  "film", 0.1, 30, True,  False, 0.0, False, False),
+    # dV/dQ 矩特征消融（导师建议）：与 B1-film-rel 唯一区别是特征向量
+    # 追加 tanh(dV/dQ) 的均值/方差/偏度，检验"相变峰预处理"是否有增量。
+    ("B1-film-rel-dvdq", AMBIENT, CHAMBER, "pretrained", True, "film", 0.1, 30, True, False, 0.0, False, True),
     # 分桶逆频率加权：与 B1-film-rel 唯一区别是损失按老化阶段加权，
     # 用于检验"健康段低估 / 深老化段高估"（向均值回归）是否被缓解。
-    ("B1-film-rel-bw", AMBIENT, CHAMBER, "pretrained", True, "film", 0.1, 30, True, True, 0.0, False),
+    ("B1-film-rel-bw", AMBIENT, CHAMBER, "pretrained", True, "film", 0.1, 30, True, True, 0.0, False, False),
     # 同循环片段对比学习必须解冻编码器才有梯度路径（冻结时表征不可变）。
     # 两个对照：解冻无对比（新基线） vs 解冻+对比（λ=0.01）。
-    ("B1-film-rel-u",  AMBIENT, CHAMBER, "pretrained", True, "film", 0.1, 30, True, False, 0.0, True),
-    ("B1-film-rel-u-cl", AMBIENT, CHAMBER, "pretrained", True, "film", 0.1, 30, True, False, 0.01, True),
-    ("B1-trans-nt",   AMBIENT, CHAMBER, "pretrained", False, "concat", 0.1, 30, False, False, 0.0, False),
-    ("B1-scratch",    AMBIENT, CHAMBER, "random",     True,  "concat", 0.1, 30, False, False, 0.0, False),
-    ("B2-trans",      CHAMBER, AMBIENT, "pretrained", True,  "concat", 0.1, 30, False, False, 0.0, False),
-    ("B2-trans-nt",   CHAMBER, AMBIENT, "pretrained", False, "concat", 0.1, 30, False, False, 0.0, False),
-    ("B2-scratch",    CHAMBER, AMBIENT, "random",     True,  "concat", 0.1, 30, False, False, 0.0, False),
+    ("B1-film-rel-u",  AMBIENT, CHAMBER, "pretrained", True, "film", 0.1, 30, True, False, 0.0, True, False),
+    ("B1-film-rel-u-cl", AMBIENT, CHAMBER, "pretrained", True, "film", 0.1, 30, True, False, 0.01, True, False),
+    ("B1-trans-nt",   AMBIENT, CHAMBER, "pretrained", False, "concat", 0.1, 30, False, False, 0.0, False, False),
+    ("B1-scratch",    AMBIENT, CHAMBER, "random",     True,  "concat", 0.1, 30, False, False, 0.0, False, False),
+    ("B2-trans",      CHAMBER, AMBIENT, "pretrained", True,  "concat", 0.1, 30, False, False, 0.0, False, False),
+    ("B2-trans-nt",   CHAMBER, AMBIENT, "pretrained", False, "concat", 0.1, 30, False, False, 0.0, False, False),
+    ("B2-scratch",    CHAMBER, AMBIENT, "random",     True,  "concat", 0.1, 30, False, False, 0.0, False, False),
     # 零样本全量：一次测评全部 20 只，各视角按测试电池过滤。
-    ("zero-all",      [],      AMBIENT + CHAMBER, "pretrained", False, "concat", 0.0, 0, False, False, 0.0, False),
+    ("zero-all",      [],      AMBIENT + CHAMBER, "pretrained", False, "concat", 0.0, 0, False, False, 0.0, False, False),
 ]
 
 
 def run_one(name: str, train: list[str], test: list[str], init: str,
             use_temp: bool, temp_mode: str, phys: float, epochs: int,
             relative_only: bool, bucket_weight: bool,
-            contrastive_lambda: float, unfreeze: bool) -> int:
+            contrastive_lambda: float, unfreeze: bool,
+            dvdq_moments: bool) -> int:
     """跑一个配置，日志落盘，返回子进程退出码。"""
     cmd = [
         PYTHON, str(SCRIPT),
@@ -99,6 +103,8 @@ def run_one(name: str, train: list[str], test: list[str], init: str,
         cmd += ["--temp-mode", temp_mode]
     if relative_only:
         cmd.append("--relative-only")
+    if dvdq_moments:
+        cmd.append("--dvdq-moments")
     if bucket_weight:
         cmd.append("--bucket-weight")
     if contrastive_lambda > 0:
