@@ -125,6 +125,81 @@ class TemperatureEmbedding(nn.Module):
         return torch.cat([e_edd, e_ffn], dim=-1)
 
 
+class FilmModulation(nn.Module):
+    """条件调制（FiLM）温度模块：温度 → γ、β，调制 SOH 表征。
+
+    数学形式（逐元素）：
+        z' = γ ⊙ z + β
+    - z : LSTM 表征 [h; c]（128 维）；
+    - γ : 逐维度缩放系数（128 维，每个维度乘到 z 对应分量上）；
+    - β : 逐维度平移量（128 维）；
+    - γ、β 由温度特征经两层 MLP 生成。
+
+    与拼接版的本质区别：
+      拼接是把温度作为"额外输入"塞给网络，网络可以自由地拿温度
+      当"电池身份标签"走捷径（B1 实验 9.76% 崩掉的原因）；
+      条件调制里温度不能提供内容，只能决定已有表征"怎么被解读"，
+      从结构上抑制"绝对温度水平 = 身份"这条捷径。
+
+    初始化技巧：生成器最后一层权重/偏置置零，forward 里 γ = raw+1，
+    于是初始 γ=1、β=0，调制层等价于恒等变换 z' = z——
+    预训练学到的 SOH 头能力被完整保留，微调时模型再慢慢学
+    "温度应该如何调节"。
+
+    输入特征建议配合 neutralize_absolute_features：绝对温度水平
+    维（0~4）抹成常数，只保留相对形状特征（温差/温升率/位置），
+    让"身份线索"没有进入生成器的入口。
+    """
+
+    def __init__(
+        self,
+        feature_dim: int = 12,
+        state_dim: int = 128,
+        hidden: int = 64,
+        feature_center: tuple[float, ...] | None = None,
+        feature_scale: tuple[float, ...] | None = None,
+    ) -> None:
+        super().__init__()
+        self.state_dim = state_dim
+
+        # 与 TemperatureEmbedding 相同的物理定标常数（feature 0~4 被
+        # 抹成 25°C 时，标准化后为 0，正是中性输入）。
+        if feature_center is None:
+            feature_center = (25.0,) * 5 + (0.0,) * 5 + (0.5, 0.5)
+        if feature_scale is None:
+            feature_scale = (10.0,) * 5 + (3.0, 3.0) + (8.0,) * 3 + (0.25, 0.25)
+        if len(feature_center) != feature_dim or len(feature_scale) != feature_dim:
+            raise ValueError(
+                f"feature_center/scale 长度必须等于 feature_dim={feature_dim}"
+            )
+        self.register_buffer(
+            "feature_center", torch.tensor(feature_center, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "feature_scale", torch.tensor(feature_scale, dtype=torch.float32)
+        )
+
+        # 生成器：归一化温度特征 -> 2*state_dim 个参数（γ、β 各一半）。
+        self.generator = nn.Sequential(
+            nn.Linear(feature_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, state_dim * 2),
+        )
+        # 关键初始化：最后一层全 0 -> 初始输出全 0 -> γ=1、β=0（恒等）。
+        nn.init.zeros_(self.generator[-1].weight)
+        nn.init.zeros_(self.generator[-1].bias)
+
+    def forward(
+        self, features: torch.Tensor, z: torch.Tensor
+    ) -> torch.Tensor:
+        """调制表征 z：返回 (..., state_dim)，维度与 z 相同。"""
+        z_norm = (features - self.feature_center) / self.feature_scale
+        raw = self.generator(z_norm)  # (..., 2*state_dim)
+        gamma, beta = raw.chunk(2, dim=-1)
+        gamma = gamma + 1.0  # 初始化为 1 -> 恒等变换
+        return gamma * z + beta
+
+
 class TemperatureSohLSTM(nn.Module):
     """共享编码器 + 输出头（电压预测 / SOH 回归），支持温度嵌入。
 
@@ -135,6 +210,9 @@ class TemperatureSohLSTM(nn.Module):
     temp_emb_dim       : 温度嵌入单路维度（EDD/FFN 各 temp_emb_dim，拼接后 2 倍）。
     temp_bins          : EDD 离散档位数 N_T（T_mean 分档）。
     temp_range         : T_mean 的离散化范围 (T_min, T_max)，°C。
+    temp_mode          : 温度嵌入方式，"concat"=拼接（EDD+FFN 双通道，默认，
+                         保持旧行为）；"film"=条件调制（FiLM，温度生成 γ、β
+                         调制 [h;c]，不改变表征维度，推荐配相对特征消融）。
     temp_feature_dim   : 温度形状特征维度（temp_features.py 的 N_FEATURES=12）。
     temp_feature_center/scale: 每特征的物理定标常数（与 temp_features.py 一致）。
     """
@@ -150,12 +228,16 @@ class TemperatureSohLSTM(nn.Module):
         temp_emb_dim: int = 16,
         temp_bins: int = 16,
         temp_range: tuple[float, float] = (0.0, 55.0),
+        temp_mode: str = "concat",
         temp_feature_dim: int = 12,
         temp_feature_center: tuple[float, ...] | None = None,
         temp_feature_scale: tuple[float, ...] | None = None,
     ) -> None:
         super().__init__()
         self.use_temp_embed = use_temp_embed
+        if temp_mode not in ("concat", "film"):
+            raise ValueError(f"temp_mode 必须是 concat 或 film，收到 {temp_mode}")
+        self.temp_mode = temp_mode
 
         # 输入嵌入：input_dim（I, V, Q[, T']）-> 128 -> 32。
         self.embed = nn.Sequential(
@@ -181,16 +263,24 @@ class TemperatureSohLSTM(nn.Module):
         # SOH 头输入 = [h; c] 拼接（128 维），可选再拼温度嵌入向量。
         soh_in_dim = hidden * 2
         if use_temp_embed:
-            self.temperature_embed = TemperatureEmbedding(
-                emb_dim=temp_emb_dim,
-                n_bins=temp_bins,
-                t_min=temp_range[0],
-                t_max=temp_range[1],
-                feature_dim=temp_feature_dim,
-                feature_center=temp_feature_center,
-                feature_scale=temp_feature_scale,
-            )
-            soh_in_dim += self.temperature_embed.out_dim
+            if temp_mode == "concat":
+                self.temperature_embed = TemperatureEmbedding(
+                    emb_dim=temp_emb_dim,
+                    n_bins=temp_bins,
+                    t_min=temp_range[0],
+                    t_max=temp_range[1],
+                    feature_dim=temp_feature_dim,
+                    feature_center=temp_feature_center,
+                    feature_scale=temp_feature_scale,
+                )
+                soh_in_dim += self.temperature_embed.out_dim
+            else:  # film：调制不改变表征维度，SOH 头仍吃 128 维
+                self.temperature_embed = FilmModulation(
+                    feature_dim=temp_feature_dim,
+                    state_dim=hidden * 2,
+                    feature_center=temp_feature_center,
+                    feature_scale=temp_feature_scale,
+                )
         self.soh_head = nn.Sequential(
             nn.Linear(soh_in_dim, head_hidden),
             nn.ReLU(),
@@ -246,8 +336,11 @@ class TemperatureSohLSTM(nn.Module):
         if self.use_temp_embed:
             if temp_features is None:
                 raise ValueError("use_temp_embed=True 时必须传入 temp_features")
-            t_emb = self.temperature_embed(temp_features)  # (B, 32)
-            state = torch.cat([state, t_emb], dim=-1)
+            if self.temp_mode == "concat":
+                t_emb = self.temperature_embed(temp_features)  # (B, 32)
+                state = torch.cat([state, t_emb], dim=-1)      # (B, 160)
+            else:  # film：温度只调制不拼接，维度保持 (B, 128)
+                state = self.temperature_embed(temp_features, state)
         return self.soh_head(state).squeeze(-1)
 
     def future_predict(self, x: torch.Tensor) -> torch.Tensor:

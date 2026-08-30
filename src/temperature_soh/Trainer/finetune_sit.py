@@ -553,6 +553,10 @@ def main() -> None:
                         help="全量低学习率微调（编码器 lr = 头的 1/10）")
     parser.add_argument("--use-temp-embed", action="store_true",
                         help="启用温度形状特征嵌入（12 维特征，EDD+FFN）")
+    parser.add_argument("--temp-mode", choices=("concat", "film"), default="concat",
+                        help="温度嵌入方式：concat=拼接（默认，旧行为）；"
+                             "film=条件调制（FiLM，温度生成 γ、β 调制表征，"
+                             "推荐配 --relative-only）")
     parser.add_argument("--relative-only", action="store_true",
                         help="温度消融：把绝对温度水平维（T_mean/T_start/T_end/"
                              "T_max/T_min）抹成固定中性值，只保留相对形状特征"
@@ -582,6 +586,7 @@ def main() -> None:
     model = TemperatureSohLSTM(
         input_dim=3,
         use_temp_embed=args.use_temp_embed,
+        temp_mode=args.temp_mode,
         temp_range=(0.0, 55.0),
         temp_feature_center=FEATURE_CENTER,
         temp_feature_scale=FEATURE_SCALE,
@@ -590,10 +595,15 @@ def main() -> None:
         if not args.pretrained.exists():
             raise FileNotFoundError(f"找不到预训练模型: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location="cpu", weights_only=True)
-        if args.use_temp_embed or args.discard_head:
-            # 温度版 SOH 头是 160 维（128+32 温度嵌入），装不下预训练的
-            # 128 维头；--discard-head 则是在无温度下故意丢弃预训练头，
-            # 用于诊断"温度模块 vs SOH 头初始化"谁在起作用。
+        # 拼接版 SOH 头是 160 维（128+32 温度嵌入），装不下预训练的 128 维
+        # 头，必须丢弃重新学；--discard-head 是在无温度下故意丢弃预训练头，
+        # 用于诊断"温度模块 vs SOH 头初始化"谁在起作用。
+        # FiLM 版调制不改变维度（仍 128 维），SOH 头与预训练完全匹配，
+        # 可以直接继承完整预训练权重（含 SOH 头），起点更好。
+        drop_head = args.discard_head or (
+            args.use_temp_embed and args.temp_mode == "concat"
+        )
+        if drop_head:
             state = {k: v for k, v in ckpt["model"].items()
                      if not k.startswith("soh_head")}
             missing, unexpected = model.load_state_dict(state, strict=False)
@@ -601,12 +611,14 @@ def main() -> None:
             print(f"初始化: 预训练编码器 {args.pretrained} "
                   f"(丢弃 SOH 头[{reason}]，missing={len(missing)})")
         else:
-            model.load_state_dict(ckpt["model"])
-            print(f"初始化: 预训练权重 {args.pretrained}")
+            missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+            print(f"初始化: 预训练权重 {args.pretrained} "
+                  f"(温度模块新参数随机初始化，missing={len(missing)})")
     else:
         print("初始化: 随机权重（SIT-only 从头训练对照）")
     model.to(device)
     print(f"设备: {device}  温度嵌入: {args.use_temp_embed}  "
+          f"方式: {args.temp_mode}  相对特征: {args.relative_only}  "
           f"物理约束λ: {args.phys_lambda}")
 
     train_cells = [c.strip() for c in args.train_cells.split(",") if c.strip()]
