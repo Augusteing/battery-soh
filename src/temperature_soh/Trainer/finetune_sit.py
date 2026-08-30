@@ -84,6 +84,12 @@ DEFAULT_OUT = ROOT / "models" / "temperature_soh" / "sit_fewshot.pt"
 DEFAULT_CACHE_DIR = ROOT / "data" / "processed" / "sit_cache"
 DEFAULT_MIN_SOH = 0.75
 
+# 老化阶段分桶边界（左闭右开，与 5.3 误差分解/报告口径一致）。
+# 逆频率加权：每个桶的权重与该桶样本数成反比，让样本少的
+# 健康段（0.95~1.00）和深老化段（0.75~0.80）在损失里不被
+# 中间段（0.90~0.95，样本最多）淹没。
+BUCKET_EDGES = (0.75, 0.80, 0.85, 0.90, 0.95, 1.001)
+
 
 # ---------------------------------------------------------------------------
 # SIT 片段构建（电池级，预加载到内存）
@@ -274,6 +280,50 @@ def filter_by_soh_full(
     return x[mask], y[mask], temp[mask], cyc[mask]
 
 
+def inverse_frequency_weights(
+    y: torch.Tensor, edges: tuple[float, ...] = BUCKET_EDGES
+) -> torch.Tensor:
+    """按老化阶段计算逆频率损失权重（与样本数成反比，平均权重 = 1）。
+
+    动机：SOH 退化数据是长尾不平衡的（健康段/深老化段样本少），
+    纯 MSE 会被样本最多的中间段主导，导致模型"向均值回归"——
+    健康段低估、深老化段高估（见 5.3 误差分解）。给样本少的桶
+    更高的权重，让各老化阶段在损失函数里同等重要。
+
+    权重公式（每个桶权重与其样本数成反比）：
+        w_i = n / (K_eff * n_bucket(i))
+    其中 n 为总样本数，K_eff 为非空桶数，n_bucket(i) 为样本 i
+    所在桶的样本数。可以验证：所有权重之和 = n，即平均权重为 1，
+    损失量级与不加权时可比（物理约束权重无需调整）。
+
+    对齐文献：
+      - arXiv 2603.10527（我们复现的论文）的 inverse-frequency
+        sampling across aging stages（采样版，这里是损失加权版）；
+      - Delving into Deep Imbalanced Regression (ICML 2021) 的
+        naive inverse (INV) 加权。
+
+    参数
+    ----
+    y     : (n,) 真实 SOH 标签。
+    edges : 分桶边界（左闭右开），默认 BUCKET_EDGES。
+
+    返回
+    ----
+    (n,) float32 权重向量，与 y 同 device。
+    """
+    edges_t = torch.tensor(edges, dtype=y.dtype, device=y.device)
+    # right=True：左闭右开 [edges[i-1], edges[i])，与误差分解口径一致。
+    # bucketize 返回"插入位置"（落在第 i 段返回 i+1），桶号 = 返回值-1。
+    # 真实标签恒在 [edges[0], edges[-1]) 内，返回值 ∈ 1..len-1。
+    bins = torch.bucketize(y, edges_t, right=True) - 1  # 0..K-2
+    counts = torch.bincount(bins, minlength=len(edges) - 1).float()
+    n = y.numel()
+    k_eff = int((counts > 0).sum().item())
+    # 样本只会落在非空桶，counts[bins] >= 1，不会除零。
+    w = n / (k_eff * counts[bins])
+    return w.float()
+
+
 # ---------------------------------------------------------------------------
 # 微调
 # ---------------------------------------------------------------------------
@@ -292,8 +342,13 @@ def finetune(
     use_temp_embed: bool = False,
     phys_lambda: float = 0.0,
     batch_size: int = 4096,
+    bucket_weight: bool = False,
 ) -> None:
-    """在 SIT 片段上微调模型（全量数据已在内存，一个 epoch 一次前向）。"""
+    """在 SIT 片段上微调模型（全量数据已在内存，一个 epoch 一次前向）。
+
+    bucket_weight=True 时，数据损失用老化阶段逆频率加权
+    （inverse_frequency_weights），物理约束损失不受影响。
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -319,9 +374,18 @@ def finetune(
     if cyc_key_train is not None:
         cyc_key_train = cyc_key_train.to(device)
     n = len(x_train)
+    w_train = inverse_frequency_weights(y_train) if bucket_weight else None
+    if w_train is not None:
+        edges_t = torch.tensor(BUCKET_EDGES, device=y_train.device)
+        counts = torch.bincount(
+            torch.bucketize(y_train, edges_t, right=True) - 1,
+            minlength=len(BUCKET_EDGES) - 1,
+        )
+        print(f"老化分桶加权: 各桶样本数 {counts.tolist()}  "
+              f"边界 {list(BUCKET_EDGES)}", flush=True)
     print(f"微调样本数: {n:,}  冻结编码器: {freeze_encoder}  "
           f"lr(头)={lr}  温度嵌入: {use_temp_embed}  "
-          f"物理约束λ: {phys_lambda}", flush=True)
+          f"物理约束λ: {phys_lambda}  分桶加权: {bucket_weight}", flush=True)
 
     for epoch in range(1, epochs + 1):
         # 每个 epoch 打乱顺序，按 batch 切分。
@@ -333,7 +397,11 @@ def finetune(
             xb, yb = x_train[idx], y_train[idx]
             tb = temp_train[idx] if use_temp_embed else None
             pred = model.soh_predict(xb, tb)
-            loss = loss_fn(pred, yb)
+            if w_train is not None:
+                # 加权 MSE：每片段误差平方乘上所属老化阶段的权重。
+                loss = torch.mean(w_train[idx] * (pred - yb) ** 2)
+            else:
+                loss = loss_fn(pred, yb)
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -570,6 +638,10 @@ def main() -> None:
                         help="保存测试集逐片段预测 parquet 的路径")
     parser.add_argument("--batch-size", type=int, default=4096,
                         help="训练/物理损失批大小（从头训练需调小避免显存不足）")
+    parser.add_argument("--bucket-weight", action="store_true",
+                        help="老化阶段逆频率加权：按真实 SOH 分桶，样本少的"
+                             "桶（健康段/深老化段）在损失里权重更高，缓解"
+                             "'向均值回归'（对齐 2603.10527 的 inverse-frequency）")
     args = parser.parse_args()
 
     if args.freeze_encoder and args.unfreeze_encoder:
@@ -683,6 +755,7 @@ def main() -> None:
             use_temp_embed=args.use_temp_embed,
             phys_lambda=args.phys_lambda,
             batch_size=args.batch_size,
+            bucket_weight=args.bucket_weight,
         )
     else:
         print("epochs=0：跳过微调，直接评估预训练模型（零样本对照）")
