@@ -407,6 +407,7 @@ def finetune(
     bucket_weight: bool = False,
     contrastive_lambda: float = 0.0,
     contrastive_tau: float = 0.1,
+    contrastive_batch_size: int = 512,
 ) -> None:
     """在 SIT 片段上微调模型（全量数据已在内存，一个 epoch 一次前向）。
 
@@ -460,33 +461,31 @@ def finetune(
           f"对比λ: {contrastive_lambda}", flush=True)
 
     for epoch in range(1, epochs + 1):
-        # 两种采样模式：
-        #  - 对比模式（contrastive_lambda>0）：按循环分组，每批随机取
-        #    batch_size//2 个循环、每循环随机取 2 个片段（正样本对）；
-        #  - 普通模式：全量打乱后线性切 batch。
+        # SOH 主任务：全量打乱后线性切 batch（与无对比时完全一致，
+        # 保证 30 个 epoch 遍历 30 遍数据，消融对比公平）。
+        perm = torch.randperm(n)
+        batch_idx_list = [
+            perm[s : s + batch_size] for s in range(0, n, batch_size)
+        ]
+        # 对比学习：为每个 SOH batch 预生成一个"对比子集"（每循环随机
+        # 取 2 个片段组成正对）。对比子集只参与对比损失，不参与 SOH。
+        cl_idx_list: list[torch.Tensor] = []
         if contrastive_lambda > 0:
             cyc_keys_all = list(groups.keys())
-            cyc_perm = torch.randperm(len(cyc_keys_all))
-            g_per_batch = max(1, batch_size // 2)
-            batch_idx_list: list[torch.Tensor] = []
-            for s in range(0, len(cyc_keys_all), g_per_batch):
+            for _ in batch_idx_list:
                 idxs: list[int] = []
-                for pos in cyc_perm[s : s + g_per_batch].tolist():
-                    members = groups[cyc_keys_all[pos]]
+                while len(idxs) < contrastive_batch_size:
+                    ck = cyc_keys_all[int(torch.randint(len(cyc_keys_all), (1,)))]
+                    members = groups[ck]
                     if len(members) >= 2:
                         idxs.extend(
                             np.random.choice(members, 2, replace=False).tolist()
                         )
-                if idxs:
-                    batch_idx_list.append(torch.tensor(idxs))
-        else:
-            perm = torch.randperm(n)
-            batch_idx_list = [
-                perm[s : s + batch_size] for s in range(0, n, batch_size)
-            ]
+                cl_idx_list.append(torch.tensor(idxs))
         total, n_batches = 0.0, 0
+        total_cl = 0.0
         model.train()
-        for idx in batch_idx_list:
+        for k, idx in enumerate(batch_idx_list):
             xb, yb = x_train[idx], y_train[idx]
             tb = temp_train[idx] if use_temp_embed else None
             pred = model.soh_predict(xb, tb)
@@ -496,11 +495,13 @@ def finetune(
             else:
                 loss = loss_fn(pred, yb)
             if contrastive_lambda > 0:
-                # 对比损失：同循环片段（2i, 2i+1）表征拉近，异循环推开。
-                _, h_n, c_n = model.encode(xb)
+                # 对比损失：对比子集里（2i, 2i+1）是同循环正对。
+                x_cl = x_train[cl_idx_list[k]]
+                _, h_n, c_n = model.encode(x_cl)
                 z = torch.cat([h_n[-1], c_n[-1]], dim=-1)  # (B, 128)
                 cl_loss = contrastive_loss(z, contrastive_tau)
                 loss = loss + contrastive_lambda * cl_loss
+                total_cl += float(cl_loss.item()) * len(x_cl)
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -549,7 +550,9 @@ def finetune(
 
         print(
             f"  [finetune-sit] epoch {epoch:3d}/{epochs}  "
-            f"loss={total / n:.6f}{phys_info}",
+            f"loss={total / n:.6f}"
+            + (f"  cl={total_cl / n_batches:.4f}" if contrastive_lambda > 0 else "")
+            + phys_info,
             flush=True,
         )
 
@@ -747,6 +750,9 @@ def main() -> None:
                              "作为正样本对拉近表征，异循环片段推开")
     parser.add_argument("--contrastive-tau", type=float, default=0.1,
                         help="对比损失温度系数（越小对相似度差异越敏感）")
+    parser.add_argument("--contrastive-batch-size", type=int, default=512,
+                        help="每个 SOH batch 附加的对比子集大小（偶数，"
+                             "每循环 2 个片段为一对）")
     args = parser.parse_args()
 
     if args.freeze_encoder and args.unfreeze_encoder:
@@ -863,6 +869,7 @@ def main() -> None:
             bucket_weight=args.bucket_weight,
             contrastive_lambda=args.contrastive_lambda,
             contrastive_tau=args.contrastive_tau,
+            contrastive_batch_size=args.contrastive_batch_size,
         )
     else:
         print("epochs=0：跳过微调，直接评估预训练模型（零样本对照）")
