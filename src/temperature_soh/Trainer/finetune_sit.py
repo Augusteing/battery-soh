@@ -547,6 +547,9 @@ def main() -> None:
                         help="全量低学习率微调（编码器 lr = 头的 1/10）")
     parser.add_argument("--use-temp-embed", action="store_true",
                         help="启用温度形状特征嵌入（12 维特征，EDD+FFN）")
+    parser.add_argument("--discard-head", action="store_true",
+                        help="预训练初始化时丢弃 SOH 头（随机头诊断实验用："
+                             "隔离'温度特征'与'SOH头初始化'两个因素）")
     parser.add_argument("--phys-lambda", type=float, default=0.0,
                         help="物理约束权重（0 = 关闭；0.1 = 与车辆微调一致）")
     parser.add_argument("--save-preds", type=Path, default=None,
@@ -574,14 +577,16 @@ def main() -> None:
         if not args.pretrained.exists():
             raise FileNotFoundError(f"找不到预训练模型: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location="cpu", weights_only=True)
-        if args.use_temp_embed:
-            # 预训练模型是 3ch 无温度版（SOH 头 128 维）；温度版 SOH 头
-            # 160 维。只加载编码器，SOH 头与温度嵌入随机初始化。
+        if args.use_temp_embed or args.discard_head:
+            # 温度版 SOH 头是 160 维（128+32 温度嵌入），装不下预训练的
+            # 128 维头；--discard-head 则是在无温度下故意丢弃预训练头，
+            # 用于诊断"温度模块 vs SOH 头初始化"谁在起作用。
             state = {k: v for k, v in ckpt["model"].items()
                      if not k.startswith("soh_head")}
             missing, unexpected = model.load_state_dict(state, strict=False)
+            reason = "温度版头维度不匹配" if args.use_temp_embed else "诊断实验"
             print(f"初始化: 预训练编码器 {args.pretrained} "
-                  f"(跳过 SOH 头，missing={len(missing)})")
+                  f"(丢弃 SOH 头[{reason}]，missing={len(missing)})")
         else:
             model.load_state_dict(ckpt["model"])
             print(f"初始化: 预训练权重 {args.pretrained}")
