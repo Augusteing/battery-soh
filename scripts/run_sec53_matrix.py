@@ -1,4 +1,4 @@
-"""5.3 跨电芯实验完整矩阵运行器（12 个配置）。
+"""5.3 跨电芯实验完整矩阵运行器（10 个配置）。
 
 三个视角 × 四种策略：
     视角 A   ：同分布跨电芯（14 训练 / 6 测试，按温度组分层）
@@ -7,7 +7,8 @@
     策略 trans      ：Severson 预训练 + SIT 微调（温度+物理全开）
          trans-nt   ：同上但关闭温度嵌入（温度消融）
          scratch    ：随机初始化 + SIT 训练（从头对照）
-         zero       ：预训练零样本，不做 SIT 微调（参考）
+    零样本（1 次全量）：预训练模型不做 SIT 微调，直接测评全部 20 只
+         SIT 电池；A/B1/B2 各视角的零样本结果由过滤预测表得到。
 
 每个配置调用 finetune_sit.py，输出：
     results/runs/sec53_<name>.log          运行日志
@@ -49,15 +50,14 @@ CONFIGS: list[tuple[str, list[str], list[str], str, bool, float, int]] = [
     ("A-trans",      A_TRAIN, A_TEST, "pretrained", True,  0.1, 30),
     ("A-trans-nt",   A_TRAIN, A_TEST, "pretrained", False, 0.1, 30),
     ("A-scratch",    A_TRAIN, A_TEST, "random",     True,  0.1, 30),
-    ("A-zero",       [],      A_TEST, "pretrained", False, 0.0, 0),
     ("B1-trans",     AMBIENT, CHAMBER, "pretrained", True,  0.1, 30),
     ("B1-trans-nt",  AMBIENT, CHAMBER, "pretrained", False, 0.1, 30),
     ("B1-scratch",   AMBIENT, CHAMBER, "random",     True,  0.1, 30),
-    ("B1-zero",      [],      CHAMBER, "pretrained", False, 0.0, 0),
     ("B2-trans",     CHAMBER, AMBIENT, "pretrained", True,  0.1, 30),
     ("B2-trans-nt",  CHAMBER, AMBIENT, "pretrained", False, 0.1, 30),
     ("B2-scratch",   CHAMBER, AMBIENT, "random",     True,  0.1, 30),
-    ("B2-zero",      [],      AMBIENT, "pretrained", False, 0.0, 0),
+    # 零样本全量：一次测评全部 20 只，各视角按测试电池过滤。
+    ("zero-all",     [],      AMBIENT + CHAMBER, "pretrained", False, 0.0, 0),
 ]
 
 
@@ -108,7 +108,7 @@ def main() -> None:
     if failed:
         print(f"\n失败配置: {failed}", flush=True)
         raise SystemExit(1)
-    print("\n全部 12 个配置完成。", flush=True)
+    print("\n全部 10 个配置完成。", flush=True)
 
 
 if __name__ == "__main__":
