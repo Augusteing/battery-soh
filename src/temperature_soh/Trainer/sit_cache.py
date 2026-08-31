@@ -11,6 +11,7 @@ SIT 数据是逐个 xlsx 存储的（20 只电池 × 约 700 循环 × 2 sheet�
   y.npy            float32 (N,)         SOH = Qc / Qc_max
   cell_ids.npy     str (N,)             每行所属电池
   temp_features.npy float32 (N, 12)     温度曲线形状特征（温度模块用）
+  T_seq.npy         float32 (N, 101)    101 点绝对温度序列（阿伦尼乌斯补偿用）
   cycle_ids.npy    int64 (N,)           每行所属循环号（物理约束用）
   meta.json        每电池样本数、总样本数
 
@@ -78,18 +79,21 @@ def build_cache(
     cell_path = cache_dir / "cell_ids.npy"
     temp_path = cache_dir / "temp_features.npy"
     cyc_path = cache_dir / "cycle_ids.npy"
+    tseq_path = cache_dir / "T_seq.npy"
     if rebuild:
         x_all = np.zeros((0, 101, 3), np.float32)
         y_all = np.zeros((0,), np.float32)
         cell_all = np.zeros((0,), dtype=object)
         temp_all = np.zeros((0, 12), np.float32)
         cyc_all = np.zeros((0,), np.int64)
+        tseq_all = np.zeros((0, 101), np.float32)
         # 直接覆盖旧文件，避免旧格式残留。
         np.save(x_path, x_all)
         np.save(y_path, y_all)
         np.save(cell_path, cell_all)
         np.save(temp_path, temp_all)
         np.save(cyc_path, cyc_all)
+        np.save(tseq_path, tseq_all)
         meta_path.write_text(
             json.dumps({"cells": [], "n": 0}, ensure_ascii=False), encoding="utf-8"
         )
@@ -108,15 +112,20 @@ def build_cache(
         cyc_all = (
             np.load(cyc_path) if cyc_path.exists() else np.zeros((0,), np.int64)
         )
+        tseq_all = (
+            np.load(tseq_path) if tseq_path.exists()
+            else np.zeros((0, 101), np.float32)
+        )
 
     t0 = time.perf_counter()
     for cell_id in todo:
         try:
-            x, y, temp, cyc = build_cell_samples_full(cell_id, data_dir)
+            x, y, temp, cyc, t_seq = build_cell_samples_full(cell_id, data_dir)
             x_all = np.concatenate([x_all, x], axis=0)
             y_all = np.concatenate([y_all, y], axis=0)
             temp_all = np.concatenate([temp_all, temp], axis=0)
             cyc_all = np.concatenate([cyc_all, cyc], axis=0)
+            tseq_all = np.concatenate([tseq_all, t_seq], axis=0)
             cell_all = np.concatenate(
                 [cell_all, np.full(len(x), cell_id, dtype=object)], axis=0
             )
@@ -127,11 +136,13 @@ def build_cache(
             np.save(cell_path, cell_all)
             np.save(temp_path, temp_all)
             np.save(cyc_path, cyc_all)
+            np.save(tseq_path, tseq_all)
             meta = {
                 "cells": sorted(done),
                 "n": int(len(y_all)),
                 "shape_x": [int(x_all.shape[0]), 101, 3],
                 "shape_temp": [int(temp_all.shape[0]), 12],
+                "shape_tseq": [int(tseq_all.shape[0]), 101],
             }
             meta_path.write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"

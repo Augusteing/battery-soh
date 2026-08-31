@@ -129,8 +129,8 @@ def build_cell_samples_full(
     cell_id: str,
     data_dir: Path,
     dvdq_channel: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """构建一只 SIT 电池的全部片段样本，返回 (x, soh, temp_features, cycle_ids)。
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """构建一只 SIT 电池的全部片段样本，返回 (x, soh, temp_features, cycle_ids, t_seq)。
 
     x             : (N, 101, 3) float32，归一化 [I(C-rate), V, Q(SOC)]；
                     dvdq_channel=True 时为 (N, 101, 4)，
@@ -138,6 +138,9 @@ def build_cell_samples_full(
     soh           : (N,) float32，标签 = Qc(k) / Qc_max；
     temp_features : (N, 12) float32，温度曲线形状特征（temp_features.py）；
     cycle_ids     : (N,) int64，每片段所属循环号（物理约束按循环聚合需要）。
+    t_seq         : (N, 101) float32，片段 101 个等容量点上的绝对温度
+                    （°C，供阿伦尼乌斯极化补偿 V_comp = V + α·I·(T−30) 使用；
+                    个别循环温度列缺失时用电池级温度兜底）。
 
     该电池的所有循环、所有合法片段都保留（约 4 万片段/电池），
     由调用方决定哪些电池进训练、哪些进测试。
@@ -152,6 +155,7 @@ def build_cell_samples_full(
     soh_list: list[np.ndarray] = []
     temp_list: list[np.ndarray] = []
     cyc_list: list[int] = []
+    tseq_list: list[np.ndarray] = []
     for cycle_number in cycles:
         cycle = read_charge_cycle(cell_id, cycle_number, data_dir)
         index = build_segment_index_for_cycle(
@@ -188,10 +192,14 @@ def build_cell_samples_full(
                 nominal_capacity=SIT_NOMINAL_CAPACITY_AH,
                 fallback_temp_c=temperature_c,
             )
+            t_seq = np.where(
+                np.isfinite(seg["T"]), seg["T"], temperature_c
+            ).astype(np.float32)
             x_list.append(x)
             soh_list.append(soh)
             temp_list.append(temp_feat)
             cyc_list.append(int(cycle_number))
+            tseq_list.append(t_seq)
 
     if not x_list:
         raise ValueError(f"{cell_id} 没有生成任何片段")
@@ -200,6 +208,7 @@ def build_cell_samples_full(
         np.asarray(soh_list, dtype=np.float32),
         np.stack(temp_list).astype(np.float32),
         np.asarray(cyc_list, dtype=np.int64),
+        np.stack(tseq_list).astype(np.float32),
     )
 
 
@@ -207,7 +216,7 @@ def build_cell_samples(
     cell_id: str, data_dir: Path
 ) -> tuple[np.ndarray, np.ndarray]:
     """兼容旧接口：只返回 (x, soh)，温度特征/循环号丢弃。"""
-    x, y, _, _ = build_cell_samples_full(cell_id, data_dir)
+    x, y, _, _, _ = build_cell_samples_full(cell_id, data_dir)
     return x, y
 
 
@@ -231,8 +240,8 @@ def load_cell_from_cache(
 
 def load_cell_from_cache_full(
     cell_id: str, cache_dir: Path
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """从扩展缓存读取 (x, soh, temp_features, cycle_ids)；缺新文件则报错。"""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """从扩展缓存读取 (x, soh, temp_features, cycle_ids, t_seq)。"""
     meta_path = cache_dir / "meta.json"
     if not meta_path.exists():
         raise FileNotFoundError(f"缓存不存在: {cache_dir}（先运行 sit_cache.py）")
@@ -251,7 +260,13 @@ def load_cell_from_cache_full(
     y = np.load(cache_dir / "y.npy")[rows]
     temp = np.load(cache_dir / "temp_features.npy", mmap_mode="r")[rows]
     cyc = np.load(cache_dir / "cycle_ids.npy")[rows]
-    return np.asarray(x), np.asarray(y), np.asarray(temp), np.asarray(cyc)
+    t_seq = None
+    if (cache_dir / "T_seq.npy").exists():
+        t_seq = np.load(cache_dir / "T_seq.npy", mmap_mode="r")[rows]
+    return (
+        np.asarray(x), np.asarray(y), np.asarray(temp), np.asarray(cyc),
+        np.asarray(t_seq) if t_seq is not None else None,
+    )
 
 
 def get_cell_samples(
@@ -271,7 +286,7 @@ def get_cell_samples_full(
     data_dir: Path,
     cache_dir: Path | None,
     dvdq_channel: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     """完整版：优先扩展缓存，否则回退 xlsx 构建（较慢）。"""
     if cache_dir is not None:
         try:
@@ -302,12 +317,16 @@ def filter_by_soh_full(
     temp: np.ndarray,
     cyc: np.ndarray,
     min_soh: float | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """完整版 SOH 过滤：x / y / 温度特征 / 循环号同步裁剪。"""
+    t_seq: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    """完整版 SOH 过滤：x / y / 温度特征 / 循环号 / 温度序列同步裁剪。"""
     if min_soh is None:
-        return x, y, temp, cyc
+        return x, y, temp, cyc, t_seq
     mask = y >= min_soh
-    return x[mask], y[mask], temp[mask], cyc[mask]
+    return (
+        x[mask], y[mask], temp[mask], cyc[mask],
+        t_seq[mask] if t_seq is not None else None,
+    )
 
 
 def inverse_frequency_weights(
@@ -429,6 +448,7 @@ def finetune(
     device: torch.device,
     seed: int = 42,
     temp_train: torch.Tensor | None = None,
+    t_seq_train: torch.Tensor | None = None,
     cyc_key_train: torch.Tensor | None = None,
     use_temp_embed: bool = False,
     phys_lambda: float = 0.0,
@@ -465,6 +485,8 @@ def finetune(
     y_train = y_train.to(device)
     if temp_train is not None:
         temp_train = temp_train.to(device)
+    if t_seq_train is not None:
+        t_seq_train = t_seq_train.to(device)
     if cyc_key_train is not None:
         cyc_key_train = cyc_key_train.to(device)
     n = len(x_train)
@@ -517,7 +539,8 @@ def finetune(
         for k, idx in enumerate(batch_idx_list):
             xb, yb = x_train[idx], y_train[idx]
             tb = temp_train[idx] if use_temp_embed else None
-            pred = model.soh_predict(xb, tb)
+            tsb = t_seq_train[idx] if t_seq_train is not None else None
+            pred = model.soh_predict(xb, tb, t_seq=tsb)
             if w_train is not None:
                 # 加权 MSE：每片段误差平方乘上所属老化阶段的权重。
                 loss = torch.mean(w_train[idx] * (pred - yb) ** 2)
@@ -602,6 +625,7 @@ def evaluate(
     relative_only: bool = False,
     dvdq_moments: bool = False,
     dvdq_channel: bool = False,
+    comp_arrhenius: bool = False,
     save_preds_path: Path | None = None,
 ) -> dict[str, dict]:
     """在指定电池上评估，返回每只电池 + 汇总统计。
@@ -610,6 +634,8 @@ def evaluate(
     relative_only=True 时把绝对温度水平维（T_mean/T_start/T_end/T_max/T_min）
         抹成固定中性值（诊断"绝对温度 = 电池身份捷径"的消融实验）；
     dvdq_moments=True 时把 tanh(dV/dQ) 的均值/方差/偏度拼到特征向量尾部；
+    comp_arrhenius=True 时加载 101 点绝对温度序列并传给模型，
+        执行阿伦尼乌斯极化补偿 V_comp = V + α·I·(T−30)；
     save_preds_path 不为空时，额外保存逐片段预测 parquet
     （cell_id, cycle_index, soh_true, soh_pred），供 5.3 图表使用。
     """
@@ -623,11 +649,18 @@ def evaluate(
     temp_of = dict(zip(cells["cell_id"], cells["temp_group"]))
 
     for cell_id in cell_ids:
-        if use_temp_embed or save_preds_path is not None or dvdq_channel:
-            x, y, temp, cyc = get_cell_samples_full(
+        if (
+            use_temp_embed
+            or save_preds_path is not None
+            or dvdq_channel
+            or comp_arrhenius
+        ):
+            x, y, temp, cyc, t_seq = get_cell_samples_full(
                 cell_id, data_dir, cache_dir, dvdq_channel=dvdq_channel
             )
-            x, y, temp, cyc = filter_by_soh_full(x, y, temp, cyc, min_soh)
+            x, y, temp, cyc, t_seq = filter_by_soh_full(
+                x, y, temp, cyc, min_soh, t_seq
+            )
             if relative_only:
                 temp = neutralize_absolute_features(temp)
             if dvdq_moments:
@@ -638,7 +671,7 @@ def evaluate(
         else:
             x, y = get_cell_samples(cell_id, data_dir, cache_dir)
             x, y = filter_by_soh(x, y, min_soh)
-            temp = cyc = None
+            temp = cyc = t_seq = None
         if len(y) == 0:
             rows[cell_id] = {
                 "temp_group": temp_of.get(cell_id, "?"),
@@ -656,7 +689,13 @@ def evaluate(
                 torch.from_numpy(temp[start : start + 4096]).to(device)
                 if use_temp_embed else None
             )
-            pred_parts.append(model.soh_predict(xb, tb).cpu().numpy())
+            tsb = (
+                torch.from_numpy(t_seq[start : start + 4096]).to(device)
+                if comp_arrhenius else None
+            )
+            pred_parts.append(
+                model.soh_predict(xb, tb, t_seq=tsb).cpu().numpy()
+            )
         pred = np.concatenate(pred_parts)
         err = pred - y
         if save_preds_path is not None:
@@ -780,6 +819,12 @@ def main() -> None:
                              "编码器）。需配合 4 通道缓存（sit_cache_dvdq）与"
                              "4 通道预训练模型（--pretrained 指向 dvdq4ch 产物）。"
                              "导师最终方案：让 LSTM 在时间步展开中学习导数流动")
+    parser.add_argument("--comp-arrhenius", action="store_true",
+                        help="阿伦尼乌斯极化补偿（导师方案）：V_comp = V + α·I·"
+                             "(T_seq − 30)，α 为可学习标量（初值 0.001），"
+                             "T_seq 为片段 101 点绝对温度。需缓存含 T_seq.npy"
+                             "（sit_cache_dvdq 重建后）。建议关闭 FiLM 单独验证"
+                             "（--use-temp-embed 不加）")
     parser.add_argument("--discard-head", action="store_true",
                         help="预训练初始化时丢弃 SOH 头（随机头诊断实验用："
                              "隔离'温度特征'与'SOH头初始化'两个因素）")
@@ -812,6 +857,9 @@ def main() -> None:
     if args.dvdq_moments and not args.use_temp_embed:
         raise ValueError("--dvdq-moments 需要启用 --use-temp-embed"
                          "（矩特征经 FiLM/特征层注入）")
+    if args.comp_arrhenius and args.dvdq_moments:
+        raise ValueError("--comp-arrhenius 与 --dvdq-moments 是两条独立路线，"
+                         "不要同时启用（矩特征方案已被通道式方案取代）")
     freeze = args.freeze_encoder or not args.unfreeze_encoder  # 默认冻结
     if args.init == "random" and freeze:
         print("提示: 随机初始化不能冻结编码器，自动切换为全量训练")
@@ -835,6 +883,7 @@ def main() -> None:
         temp_feature_dim=feature_dim,
         temp_feature_center=feature_center,
         temp_feature_scale=feature_scale,
+        enable_comp=args.comp_arrhenius,
     )
     if args.init == "pretrained":
         if not args.pretrained.exists():
@@ -873,7 +922,7 @@ def main() -> None:
     print(f"设备: {device}  温度嵌入: {args.use_temp_embed}  "
           f"方式: {args.temp_mode}  相对特征: {args.relative_only}  "
           f"dV/dQ矩: {args.dvdq_moments}  dV/dQ通道: {args.dvdq_channel}  "
-          f"物理约束λ: {args.phys_lambda}")
+          f"阿伦尼乌斯补偿: {args.comp_arrhenius}  物理约束λ: {args.phys_lambda}")
 
     train_cells = [c.strip() for c in args.train_cells.split(",") if c.strip()]
     all_cells = discover_sit_cells(args.data_dir)["cell_id"].tolist()
@@ -888,25 +937,27 @@ def main() -> None:
 
     # 预加载微调数据（温度/物理需要完整版：含温度特征与循环号）。
     # epochs=0 且无训练电池 = 纯零样本评估，跳过数据构建。
-    x_train = y_train = temp_train = cyc_key_train = None
+    x_train = y_train = temp_train = t_seq_train = cyc_key_train = None
     if args.epochs > 0 or train_cells:
         print("构建 few-shot 微调片段 ...", flush=True)
         t0 = time.perf_counter()
         xs, ys = [], []
         temps, cyc_keys = [], []
+        tseqs = []
         for cell_id in train_cells:
             if (
                 args.use_temp_embed
                 or args.phys_lambda > 0
                 or args.contrastive_lambda > 0
                 or args.dvdq_channel
+                or args.comp_arrhenius
             ):
-                x, y, temp, cyc = get_cell_samples_full(
+                x, y, temp, cyc, t_seq = get_cell_samples_full(
                     cell_id, args.data_dir, args.cache_dir,
                     dvdq_channel=args.dvdq_channel,
                 )
-                x, y, temp, cyc = filter_by_soh_full(
-                    x, y, temp, cyc, args.min_soh
+                x, y, temp, cyc, t_seq = filter_by_soh_full(
+                    x, y, temp, cyc, args.min_soh, t_seq
                 )
                 if args.relative_only:
                     temp = neutralize_absolute_features(temp)
@@ -920,6 +971,13 @@ def main() -> None:
                 cyc_keys.append(
                     np.full(len(cyc), len(xs), dtype=np.int64) * 1_000_000 + cyc
                 )
+                if args.comp_arrhenius:
+                    if t_seq is None:
+                        raise ValueError(
+                            f"{cell_id} 缓存缺少 T_seq.npy（101 点温度序列），"
+                            "请用新版 sit_cache.py 重建 sit_cache_dvdq"
+                        )
+                    tseqs.append(t_seq)
             else:
                 x, y = get_cell_samples(cell_id, args.data_dir, args.cache_dir)
                 x, y = filter_by_soh(x, y, args.min_soh)
@@ -936,6 +994,9 @@ def main() -> None:
             temp_train = (
                 torch.from_numpy(np.concatenate(temps)) if temps else None
             )
+            t_seq_train = (
+                torch.from_numpy(np.concatenate(tseqs)) if tseqs else None
+            )
             cyc_key_train = (
                 torch.from_numpy(np.concatenate(cyc_keys)) if cyc_keys else None
             )
@@ -944,6 +1005,7 @@ def main() -> None:
         finetune(
             model, x_train, y_train, args.epochs, args.lr, freeze, device,
             temp_train=temp_train,
+            t_seq_train=t_seq_train,
             cyc_key_train=cyc_key_train,
             use_temp_embed=args.use_temp_embed,
             phys_lambda=args.phys_lambda,
@@ -963,6 +1025,7 @@ def main() -> None:
         relative_only=args.relative_only,
         dvdq_moments=args.dvdq_moments,
         dvdq_channel=args.dvdq_channel,
+        comp_arrhenius=args.comp_arrhenius,
         save_preds_path=args.save_preds,
     )
     _print_report(rows)

@@ -215,6 +215,12 @@ class TemperatureSohLSTM(nn.Module):
                          调制 [h;c]，不改变表征维度，推荐配相对特征消融）。
     temp_feature_dim   : 温度形状特征维度（temp_features.py 的 N_FEATURES=12）。
     temp_feature_center/scale: 每特征的物理定标常数（与 temp_features.py 一致）。
+    enable_comp        : 是否启用阿伦尼乌斯极化补偿（可学习 α）。
+                         补偿公式（一阶泰勒展开，导师方案）：
+                         V_comp = V_raw + α·I·(T_seq − T_ref)
+                         T_ref = 30°C（Severson 基准），α 初值 0.001。
+                         只用于阶段二微调（t_seq 由 SIT 缓存提供）；
+                         阶段一（Severson 30°C）传 t_seq=None，恒等。
     """
 
     def __init__(
@@ -232,12 +238,23 @@ class TemperatureSohLSTM(nn.Module):
         temp_feature_dim: int = 12,
         temp_feature_center: tuple[float, ...] | None = None,
         temp_feature_scale: tuple[float, ...] | None = None,
+        enable_comp: bool = False,
     ) -> None:
         super().__init__()
         self.use_temp_embed = use_temp_embed
+        self.enable_comp = enable_comp
         if temp_mode not in ("concat", "film"):
             raise ValueError(f"temp_mode 必须是 concat 或 film，收到 {temp_mode}")
         self.temp_mode = temp_mode
+
+        # 阿伦尼乌斯极化补偿：可学习标量 α（V/(C-rate·°C) 量纲）。
+        # 初值 0.001 与 LFP 典型参数粗估一致（R·Ea/(Rg·T²)），
+        # 由微调梯度在正确量级附近微调。T_ref 固定为 Severson 30°C。
+        if enable_comp:
+            self.alpha_comp = nn.Parameter(
+                torch.tensor(0.001, dtype=torch.float32)
+            )
+            self.T_ref = 30.0
 
         # 输入嵌入：input_dim（I, V, Q[, T']）-> 128 -> 32。
         self.embed = nn.Sequential(
@@ -302,15 +319,32 @@ class TemperatureSohLSTM(nn.Module):
         )
 
     def encode(
-        self, x: torch.Tensor
+        self, x: torch.Tensor, t_seq: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """把 (B, T, 4) 输入编码成 LSTM 输出和最终状态。
+        """把 (B, T, input_dim) 输入编码成 LSTM 输出和最终状态。
+
+        t_seq 不为空且启用补偿时，先做物理前置校准：
+            V_comp = V_raw + α·I·(T_seq − T_ref)
+        把偏离 30°C 基准的极化压降拉回基准流形（逐元素运算，
+        不依赖温度分布方差，只依赖绝对温度偏差）。I 通道已按
+        C-rate 归一化，充电为正，公式符号自动匹配极化方向。
 
         返回:
             lstm_out : (B, T, hidden)，每个时间步的隐藏状态；
             h_n      : (1, B, hidden)，最后一个时间步的隐藏状态；
             c_n      : (1, B, hidden)，最后一个时间步的细胞状态。
         """
+        if self.enable_comp and t_seq is not None:
+            if x.shape[-1] < 2 or t_seq.shape != x.shape[:-1]:
+                raise ValueError(
+                    "t_seq 形状必须与 x 的 (B, T) 一致："
+                    f"x={tuple(x.shape)} t_seq={tuple(t_seq.shape)}"
+                )
+            i_curve = x[..., 0]                      # (B, T) C-rate
+            v_comp = x[..., 1] + self.alpha_comp * i_curve * (t_seq - self.T_ref)
+            x_comp = x.clone()                       # 避免 inplace 修改
+            x_comp[..., 1] = v_comp
+            x = x_comp
         emb = self.embed(x)  # (B, T, 32)
         lstm_out, (h_n, c_n) = self.lstm(emb)
         return lstm_out, h_n, c_n
@@ -321,7 +355,10 @@ class TemperatureSohLSTM(nn.Module):
         return self.voltage_head(lstm_out).squeeze(-1)
 
     def soh_predict(
-        self, x: torch.Tensor, temp_features: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        temp_features: torch.Tensor | None = None,
+        t_seq: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """用 [h; c]（可选 + 温度嵌入）回归标量 SOH。
 
@@ -331,7 +368,7 @@ class TemperatureSohLSTM(nn.Module):
         temp_features : (B, F) 温度形状特征（物理单位），仅
                         use_temp_embed=True 时必需，否则会被忽略。
         """
-        _, h_n, c_n = self.encode(x)
+        _, h_n, c_n = self.encode(x, t_seq=t_seq)
         state = torch.cat([h_n[-1], c_n[-1]], dim=-1)  # (B, 128)
         if self.use_temp_embed:
             if temp_features is None:
